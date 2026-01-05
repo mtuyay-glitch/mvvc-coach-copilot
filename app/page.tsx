@@ -9,8 +9,7 @@ export default function HomePage() {
   const supabase = useMemo(() => supabaseBrowser(), []);
   const [sessionEmail, setSessionEmail] = useState<string | null>(null);
 
-  const [teamId, setTeamId] = useState("");
-  const [season, setSeason] = useState<"fall" | "spring" | "summer">("spring");
+// Team and season are now fixed server-side
   const [question, setQuestion] = useState("");
   const [msgs, setMsgs] = useState<Msg[]>([
     { role: "assistant", content: "Ask a question (e.g., 'Best spring lineup?' or 'Protect Jayden in SR using Bodhi?'). I will cite the retrieved facts." }
