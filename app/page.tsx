@@ -83,25 +83,7 @@ export default function HomePage() {
         </div>
       </header>
 
-      <section style={{ marginTop: 16, display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
-        <label style={{ display: "grid", gap: 6 }}>
-          <span style={{ fontSize: 12, opacity: 0.7 }}>Team ID (Supabase UUID)</span>
-          <input value={teamId} onChange={(e) => setTeamId(e.target.value)} placeholder="e.g., 3b1a...uuid" />
-        </label>
 
-        <label style={{ display: "grid", gap: 6 }}>
-          <span style={{ fontSize: 12, opacity: 0.7 }}>Season</span>
-          <select value={season} onChange={(e) => setSeason(e.target.value as any)}>
-            <option value="fall">Fall</option>
-            <option value="spring">Spring</option>
-            <option value="summer">Summer</option>
-          </select>
-        </label>
-
-        <div style={{ alignSelf: "end", fontSize: 12, opacity: 0.7 }}>
-          Tip: for production, replace Team ID input with a dropdown populated from membership.
-        </div>
-      </section>
 
       <main style={{ marginTop: 16, border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
         <div style={{ height: 440, overflow: "auto", padding: 8, background: "#fafafa", borderRadius: 10 }}>
