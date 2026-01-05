@@ -51,8 +51,7 @@ export default function HomePage() {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ teamId, season, question: q })
-      });
+body: JSON.stringify({ question: q })      });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error ?? "Request failed");
       setMsgs((m) => [...m, { role: "assistant", content: data.answer }]);
@@ -104,14 +103,12 @@ export default function HomePage() {
             onKeyDown={(e) => { if (e.key === "Enter") ask(); }}
             disabled={busy}
           />
-          <button onClick={ask} disabled={busy || !sessionEmail || !teamId}>
-            {busy ? "Thinking…" : "Ask"}
+<button onClick={ask} disabled={busy || !sessionEmail}>            {busy ? "Thinking…" : "Ask"}
           </button>
         </div>
 
         {error && <div style={{ marginTop: 10, color: "crimson" }}>{error}</div>}
         {!sessionEmail && <div style={{ marginTop: 10, opacity: 0.7 }}>Sign in to ask questions.</div>}
-        {!teamId && <div style={{ marginTop: 6, opacity: 0.7 }}>Enter a Team ID to route queries to the correct dataset.</div>}
       </main>
 
       <footer style={{ marginTop: 14, fontSize: 12, opacity: 0.75 }}>
