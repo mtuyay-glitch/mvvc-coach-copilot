@@ -11,13 +11,33 @@ async function retrieveContext(teamId: string, season: string, question: string)
   const supabase = supabaseService();
 
   // 1) Knowledge chunks (narrative + rules)
-  const { data: chunks, error: e1 } = await supabase
-    .from("knowledge_chunks")
-    .select("id,title,content,tags")
-    .eq("team_id", teamId)
-    .eq("season", season)
-    .textSearch("tsv", question.replace(/[^a-zA-Z0-9 ]/g, " "), { type: "websearch" })
-    .limit(6);
+// 1) Always fetch roster chunks (so questions like “Is Koa on the team?” work)
+const { data: rosterChunks, error: er } = await supabase
+  .from("knowledge_chunks")
+  .select("id,title,content,tags")
+  .eq("team_id", teamId)
+  .contains("tags", ["roster"])
+  .limit(5);
+
+if (er) throw er;
+
+// 2) Also fetch relevant notes/rules by search (season-specific)
+const cleaned = question.replace(/[^a-zA-Z0-9 ]/g, " ");
+const { data: searchChunks, error: e1 } = await supabase
+  .from("knowledge_chunks")
+  .select("id,title,content,tags")
+  .eq("team_id", teamId)
+  .eq("season", season)
+  .textSearch("tsv", cleaned, { type: "websearch" })
+  .limit(6);
+
+if (e1) throw e1;
+
+// Merge + dedupe (by id)
+const mergedMap = new Map<number, any>();
+(rosterChunks ?? []).forEach((c: any) => mergedMap.set(c.id, c));
+(searchChunks ?? []).forEach((c: any) => mergedMap.set(c.id, c));
+const chunks = Array.from(mergedMap.values());
 
   if (e1) throw e1;
 
