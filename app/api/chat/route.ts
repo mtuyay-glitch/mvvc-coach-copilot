@@ -126,7 +126,6 @@ const teamId = TEAM_ID;
 const season = DEFAULT_SEASON;
     const question = (body.question ?? "").trim();
 
-    if (!teamId) return NextResponse.json({ error: "teamId is required" }, { status: 400 });
     if (!question) return NextResponse.json({ error: "question is required" }, { status: 400 });
 
     const { chunks, metrics } = await retrieveContext(teamId, season, question);
