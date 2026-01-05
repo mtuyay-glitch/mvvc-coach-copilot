@@ -118,9 +118,12 @@ Rules:
 
 export async function POST(req: Request) {
   try {
-    const body = (await req.json()) as Req;
-    const teamId = (body.teamId ?? "").trim();
-    const season = body.season;
+const TEAM_ID = "7d5c9d23-e78c-4b08-8869-64cece1acee5";
+const DEFAULT_SEASON = "spring";
+
+const body = (await req.json()) as { question: string };
+const teamId = TEAM_ID;
+const season = DEFAULT_SEASON;
     const question = (body.question ?? "").trim();
 
     if (!teamId) return NextResponse.json({ error: "teamId is required" }, { status: 400 });
