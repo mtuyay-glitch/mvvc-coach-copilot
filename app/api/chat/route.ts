@@ -76,7 +76,7 @@ async function callOpenAI(question: string, context: string) {
           role: "system",
           content: [
             {
-              type: "text",
+              type: "input_text",
               text:
 `You are a team-private volleyball analytics assistant for coaches.
 Rules:
@@ -91,7 +91,7 @@ Rules:
         {
           role: "user",
           content: [
-            { type: "text", text: `Question: ${question}\n\n${context}` }
+            { type: "input_text", text: `Question: ${question}\n\n${context}` }
           ]
         }
       ]
