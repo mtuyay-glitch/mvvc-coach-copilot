@@ -7,7 +7,7 @@ export async function GET() {
   return NextResponse.json({ ok: true, route: "/api/import", methods: ["GET", "POST"] });
 }
 
-// Simple CSV parser: works for "plain" CSVs (no commas inside quoted fields).
+// Simple CSV parser (basic, no quoted commas)
 function csvToRows(text: string) {
   const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
   if (lines.length < 2) return [];
@@ -41,16 +41,9 @@ export async function POST(req: Request) {
     if (!season) return NextResponse.json({ error: "season required" }, { status: 400 });
     if (!(file instanceof File)) return NextResponse.json({ error: "file required" }, { status: 400 });
 
-    if (!process.env.NEXT_PUBLIC_SUPABASE_URL) {
-      return NextResponse.json({ error: "Missing NEXT_PUBLIC_SUPABASE_URL" }, { status: 500 });
-    }
-    if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
-      return NextResponse.json({ error: "Missing SUPABASE_SERVICE_ROLE_KEY" }, { status: 500 });
-    }
-
     const supabase = createClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL,
-      process.env.SUPABASE_SERVICE_ROLE_KEY
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!
     );
 
     const text = await file.text();
@@ -58,7 +51,7 @@ export async function POST(req: Request) {
 
     if (rows.length === 0) {
       return NextResponse.json(
-        { error: "CSV parsed 0 data rows (check headers / formatting)" },
+        { error: "CSV parsed 0 data rows" },
         { status: 400 }
       );
     }
@@ -69,26 +62,17 @@ export async function POST(req: Request) {
       const playerName = (r["Name"] || r["Player"] || "").trim();
       if (!playerName) continue;
 
-      const gameDate = (r["GameDate"] || "").trim() || null;
-      const opponent = (r["Opponent"] || "").trim() || null;
-      const sourceFile = (r["SourceFile"] || "").trim() || file.name || null;
-      const position = (r["Position"] || "").trim() || null;
-
-      const { Name, Player, GameDate, Opponent, SourceFile, Position, ...rest } = r;
+      const { Name, Player, ...stats } = r;
 
       const { error } = await supabase.from("player_game_stats").insert({
         team_id: teamId,
         season,
-        game_date: gameDate,
-        opponent,
-        source_file: sourceFile,
         player_name: playerName,
-        position,
-        stats: rest,
+        stats,
       });
 
       if (error) {
-        return NextResponse.json({ error: `Supabase insert failed: ${error.message}` }, { status: 500 });
+        return NextResponse.json({ error: error.message }, { status: 500 });
       }
 
       rowsInserted++;
@@ -96,6 +80,6 @@ export async function POST(req: Request) {
 
     return NextResponse.json({ ok: true, rowsParsed: rows.length, rowsInserted });
   } catch (e: any) {
-    return NextResponse.json({ error: e?.message ?? String(e) }, { status: 500 });
+    return NextResponse.json({ error: String(e) }, { status: 500 });
   }
 }
