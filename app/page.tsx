@@ -53,9 +53,12 @@ function toNiceHtml(raw: string) {
     const t = line.trim();
     if (!t) return false;
     if (/^(FACT:|PROJECTION:|Next steps:)/i.test(t)) return true;
-    // Common section titles (no colon)
-    if (/^(Short answer|Roster snapshot|Strengths|Improvement areas|Actionable Next steps|What I cannot provide)/i.test(t)) return true;
-    // Any "Title — subtitle" style
+    if (
+      /^(Short answer|Roster snapshot|Strengths|Improvement areas|Actionable Next steps|What I cannot provide)/i.test(
+        t
+      )
+    )
+      return true;
     if (/^[A-Za-z].{0,60}—/.test(t)) return true;
     return false;
   };
@@ -64,14 +67,12 @@ function toNiceHtml(raw: string) {
     const line = lines[i];
     const t = line.trim();
 
-    // Blank line => paragraph separation
     if (!t) {
       closeList();
       html += `<div style="height:10px"></div>`;
       continue;
     }
 
-    // Bullet list
     if (t.startsWith("- ")) {
       if (!inList) {
         closeList();
@@ -83,14 +84,12 @@ function toNiceHtml(raw: string) {
       continue;
     }
 
-    // Heading
     if (isHeading(t)) {
       closeList();
       html += `<div class="niceHeading">${t}</div>`;
       continue;
     }
 
-    // Normal paragraph line
     closeList();
     html += `<div class="nicePara">${t}</div>`;
   }
@@ -101,6 +100,21 @@ function toNiceHtml(raw: string) {
   html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
 
   return html;
+}
+
+function AssistantLabel() {
+  return (
+    <div style={styles.assistantLabel}>
+      <img
+        src="/mvvc-logo.png"
+        alt="MVVC"
+        width={18}
+        height={18}
+        style={styles.assistantLogo}
+      />
+      <span>Coaching Assistant</span>
+    </div>
+  );
 }
 
 export default function HomePage() {
@@ -163,8 +177,21 @@ export default function HomePage() {
     <main style={styles.page}>
       <section style={styles.card}>
         <header style={styles.header}>
-          <h1 style={styles.title}>MVVC Coach Copilot</h1>
-          <p style={styles.subtitle}>Fast, coach-friendly answers from your team stats</p>
+          <div style={styles.headerRow}>
+            <img
+              src="/mvvc-logo.png"
+              alt="MVVC"
+              width={28}
+              height={28}
+              style={styles.headerLogo}
+            />
+            <div>
+              <h1 style={styles.title}>MVVC Coach Copilot</h1>
+              <p style={styles.subtitle}>
+                Fast, coach-friendly answers from your team stats
+              </p>
+            </div>
+          </div>
         </header>
 
         <div style={styles.chat}>
@@ -183,7 +210,7 @@ export default function HomePage() {
                 }}
               >
                 <div style={styles.bubbleHeader}>
-                  <strong>{m.role === "user" ? "You" : "Coaching Assistant"}</strong>
+                  {m.role === "user" ? <strong>You</strong> : <AssistantLabel />}
                 </div>
 
                 {m.role === "user" ? (
@@ -202,7 +229,7 @@ export default function HomePage() {
             <div style={styles.msg}>
               <div style={styles.bubble}>
                 <div style={styles.bubbleHeader}>
-                  <strong>Coaching Assistant</strong>
+                  <AssistantLabel />
                 </div>
                 <div style={styles.textPlain}>Analyzing…</div>
               </div>
@@ -251,13 +278,12 @@ export default function HomePage() {
         {error && <div style={styles.error}>{error}</div>}
       </section>
 
-      {/* Tiny CSS helpers for nicer spacing */}
       <style>{`
-        .niceChat { margin-top: 6px; line-height: 1.5; }
-        .niceHeading { font-weight: 700; margin-top: 6px; }
-        .nicePara { margin-top: 6px; }
-        .niceList { margin: 8px 0 0 18px; padding: 0; }
-        .niceList li { margin: 6px 0; }
+        .niceChat { margin-top: 6px; line-height: 1.55; }
+        .niceHeading { font-weight: 800; margin-top: 8px; }
+        .nicePara { margin-top: 8px; }
+        .niceList { margin: 10px 0 0 18px; padding: 0; }
+        .niceList li { margin: 7px 0; }
       `}</style>
     </main>
   );
@@ -281,6 +307,14 @@ const styles: Record<string, React.CSSProperties> = {
   },
   header: {
     marginBottom: 12
+  },
+  headerRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10
+  },
+  headerLogo: {
+    borderRadius: 8
   },
   title: {
     margin: 0,
@@ -308,7 +342,17 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: "0.96rem"
   },
   bubbleHeader: {
-    opacity: 0.85
+    opacity: 0.9
+  },
+  assistantLabel: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 8,
+    fontWeight: 700
+  },
+  assistantLogo: {
+    borderRadius: 4,
+    display: "inline-block"
   },
   userBubble: {
     background: "#2563eb",
