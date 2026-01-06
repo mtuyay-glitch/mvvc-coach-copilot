@@ -44,7 +44,11 @@ export default function HomePage() {
     setError(null);
     setInput("");
 
-    const nextMessages = [...messages, { role: "user", content: question }];
+    // ✅ Force correct Msg[] typing so TS doesn't widen role to string
+    const nextMessages: Msg[] = [
+      ...messages,
+      { role: "user" as const, content: question }
+    ];
     setMessages(nextMessages);
 
     try {
@@ -60,7 +64,10 @@ export default function HomePage() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Request failed");
 
-      setMessages((m) => [...m, { role: "assistant", content: data.answer }]);
+      setMessages((m): Msg[] => [
+        ...m,
+        { role: "assistant" as const, content: data.answer }
+      ]);
     } catch (e: any) {
       setError(e.message || "Something went wrong");
     } finally {
