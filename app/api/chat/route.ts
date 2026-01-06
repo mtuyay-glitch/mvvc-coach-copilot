@@ -22,34 +22,21 @@ function assertEnv(name: string) {
   if (!process.env[name]) throw new Error(`Missing env var: ${name}`);
 }
 
-function normalizeQuestion(q: string) {
-  return q.toLowerCase().replace(/\s+/g, " ").trim();
-}
-
 /**
- * FINAL formatting pass to make answers readable in chat:
+ * Final formatting pass for readability:
  * - removes citation noise
  * - adds spacing between sections
  * - ensures bullets render cleanly
  */
 function formatForChat(text: string) {
   return text
-    // remove any leftover citations
     .replace(/\s*\[(?:K|M|S)\d+\]\s*/g, " ")
-
-    // normalize headers
     .replace(/\bFACT:\b/g, "\nFACT:\n")
     .replace(/\bPROJECTION:\b/g, "\nPROJECTION:\n")
     .replace(/\bNext steps\b/gi, "\nNext steps:\n")
-
-    // clean section titles
     .replace(/FACT\s+—/g, "\nFACT —")
     .replace(/PROJECTION\s+—/g, "\nPROJECTION —")
-
-    // force bullets to new lines
     .replace(/\s-\s/g, "\n- ")
-
-    // collapse excessive whitespace
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
@@ -68,16 +55,15 @@ const PLAYER_POSITIONS: Record<string, string[]> = {
   Allen: ["OPP"],
   Koa: ["S", "L", "DS"],
   Ryota: ["DS", "L"],
-  Steven: ["S"],
+  Steven: ["S"]
 };
 
 /* ============================
-   Context retrieval (notes + metrics)
+   Context retrieval (notes + rules)
 ============================ */
 async function retrieveContext(question: string) {
   const supabase = supabaseService();
 
-  // Always include roster context
   const { data: rosterChunks } = await supabase
     .from("knowledge_chunks")
     .select("title,content")
@@ -85,7 +71,6 @@ async function retrieveContext(question: string) {
     .contains("tags", ["roster"])
     .limit(5);
 
-  // Season-specific search
   const cleaned = question.replace(/[^a-zA-Z0-9 ]/g, " ");
   const { data: searchChunks } = await supabase
     .from("knowledge_chunks")
@@ -110,75 +95,58 @@ async function retrieveStatsFacts(question: string) {
     .eq("team_id", TEAM_ID)
     .eq("season", DEFAULT_SEASON);
 
-  if (error || !data || data.length === 0) {
-    return "";
-  }
+  if (error || !data || data.length === 0) return "";
 
   const rows = data as Array<{ player_name: string; stats: Record<string, any> }>;
   const q = question.toLowerCase();
 
-  // Helpers
   const toNum = (v: any) => {
+    if (v === null || v === undefined || v === "") return null;
     const n = Number(v);
     return Number.isFinite(n) ? n : null;
   };
 
-  // Key mapping (volleyball-aware)
-  const synonymRules: Array<{ re: RegExp; key: string }> = [
-    { re: /passer rating|serve receive rating|sr rating/i, key: "serve_receive_passing_rating" },
-    { re: /kill|kills/i, key: "attack_kills" },
-    { re: /dig|digs/i, key: "digs_successful" },
-    { re: /ace|aces/i, key: "serve_aces" },
-    { re: /serve error/i, key: "serve_errors" },
+  // Map common questions to keys in stats JSON
+  const synonymRules: Array<{ re: RegExp; key: string; label: string }> = [
+    { re: /passer rating|serve receive rating|sr rating/i, key: "serve_receive_passing_rating", label: "Serve-receive passing rating (0–3)" },
+    { re: /\bkills?\b/i, key: "attack_kills", label: "Kills" },
+    { re: /\bdigs?\b/i, key: "digs_successful", label: "Digs" },
+    { re: /\baces?\b/i, key: "serve_aces", label: "Serve aces" },
+    { re: /serve errors?/i, key: "serve_errors", label: "Serve errors" }
   ];
 
-  let statKey: string | null = null;
-  for (const r of synonymRules) {
-    if (r.re.test(q)) {
-      statKey = r.key;
-      break;
-    }
-  }
+  const match = synonymRules.find((r) => r.re.test(q));
+  if (!match) return "";
 
-  if (!statKey) return "";
-
-  // Aggregate
   const totals: Record<string, number> = {};
   for (const row of rows) {
-    const v = toNum(row.stats?.[statKey]);
+    const v = toNum(row.stats?.[match.key]);
     if (v === null) continue;
     totals[row.player_name] = (totals[row.player_name] ?? 0) + v;
   }
 
   const ranked = Object.entries(totals)
     .sort((a, b) => b[1] - a[1])
-    .slice(0, 8);
+    .slice(0, 10);
 
   if (ranked.length === 0) return "";
 
-  let out = `FACT — current-season ${statKey.replace(/_/g, " ")} leaders\n`;
-  for (const [player, value] of ranked) {
-    out += `- ${player}: ${value}\n`;
-  }
-
+  let out = `FACT — ${match.label} leaders (season total)\n`;
+  for (const [player, value] of ranked) out += `- ${player}: ${value}\n`;
   return out;
 }
 
 /* ============================
-   OpenAI call
+   OpenAI call (FIXED for Responses API)
 ============================ */
-async function callOpenAI(
-  question: string,
-  messages: Msg[] | undefined,
-  context: string
-) {
+async function callOpenAI(question: string, messages: Msg[] | undefined, context: string) {
   assertEnv("OPENAI_API_KEY");
   const model = process.env.OPENAI_MODEL ?? "gpt-5-mini";
 
   const recent = (messages ?? []).slice(-10);
 
   const systemText = `
-You are a volleyball analytics assistant for MVVC 14 Black.
+You are the Coaching Assistant for MVVC 14 Black.
 
 Rules:
 - Use ONLY the provided context and stats facts.
@@ -189,33 +157,46 @@ Rules:
 
 Stat semantics:
 - serve_receive_passing_rating is a 0–3 scale.
-- Percentage fields are stored as 0–1; report as percentages.
-`;
+- Percentage fields may be stored as 0–1; if you see those, report as percentages.
+`.trim();
+
+  // ✅ IMPORTANT: In Responses API history:
+  // user => input_text
+  // assistant => output_text
+  const history = recent.map((m) => ({
+    role: m.role,
+    content: [
+      {
+        type: m.role === "assistant" ? "output_text" : "input_text",
+        text: m.content
+      }
+    ]
+  }));
 
   const input = [
-    { role: "system", content: [{ type: "input_text", text: systemText }] },
-    ...recent.map((m) => ({
-      role: m.role,
-      content: [{ type: "input_text", text: m.content }],
-    })),
+    {
+      role: "system",
+      content: [{ type: "input_text", text: systemText }]
+    },
+    ...history,
     {
       role: "user",
       content: [
         {
           type: "input_text",
-          text: `Question: ${question}\n\nContext:\n${context}`,
-        },
-      ],
-    },
+          text: `Question: ${question}\n\nContext:\n${context}`
+        }
+      ]
+    }
   ];
 
   const res = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
+      "Content-Type": "application/json"
     },
-    body: JSON.stringify({ model, input }),
+    body: JSON.stringify({ model, input })
   });
 
   if (!res.ok) {
@@ -224,15 +205,15 @@ Stat semantics:
   }
 
   const json = await res.json();
-  let text = "";
 
+  let text = "";
   for (const item of json.output ?? []) {
     for (const c of item.content ?? []) {
-      if (c.type === "output_text") text += c.text;
+      if (c.type === "output_text" && typeof c.text === "string") text += c.text;
     }
   }
 
-  return text.trim();
+  return text.trim() || "No answer generated.";
 }
 
 /* ============================
@@ -240,26 +221,21 @@ Stat semantics:
 ============================ */
 export async function POST(req: Request) {
   try {
-    const body = (await req.json()) as {
-      question: string;
-      messages?: Msg[];
-    };
+    const body = (await req.json()) as { question: string; messages?: Msg[] };
 
     const question = (body.question ?? "").trim();
-    if (!question) {
-      return NextResponse.json({ error: "question is required" }, { status: 400 });
-    }
+    if (!question) return NextResponse.json({ error: "question is required" }, { status: 400 });
 
     const chunks = await retrieveContext(question);
     const statsFacts = await retrieveStatsFacts(question);
 
     let context = "";
+
     if (chunks.length) {
       context += "Notes / roster context:\n";
-      for (const c of chunks) {
-        context += `- ${c.title}: ${c.content}\n`;
-      }
+      for (const c of chunks) context += `- ${c.title}: ${c.content}\n`;
     }
+
     if (statsFacts) {
       context += `\n${statsFacts}\n`;
     }
@@ -274,9 +250,6 @@ export async function POST(req: Request) {
 
     return NextResponse.json({ answer });
   } catch (e: any) {
-    return NextResponse.json(
-      { error: e?.message ?? String(e) },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: e?.message ?? String(e) }, { status: 500 });
   }
 }
