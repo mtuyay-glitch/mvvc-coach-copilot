@@ -1,32 +1,16 @@
 import { NextResponse } from "next/server";
 import { supabaseService } from "../../../lib/supabaseServer";
 
-/* ============================
-   Types
-============================ */
-type Msg = {
-  role: "user" | "assistant";
-  content: string;
-};
+type Msg = { role: "user" | "assistant"; content: string };
 
-/* ============================
-   Constants (hard-coded team)
-============================ */
 const TEAM_ID = "7d5c9d23-e78c-4b08-8869-64cece1acee5";
 const DEFAULT_SEASON: "fall" | "spring" | "summer" = "spring";
 
-/* ============================
-   Utilities
-============================ */
 function assertEnv(name: string) {
   if (!process.env[name]) throw new Error(`Missing env var: ${name}`);
 }
 
-/**
- * Player name highlighting (subtle)
- * - wraps known player names in **bold**
- * - avoids double-bolding
- */
+/* Player names to highlight */
 const PLAYER_NAMES = [
   "Eric",
   "Brooks",
@@ -42,48 +26,74 @@ const PLAYER_NAMES = [
 ];
 
 function highlightPlayerNames(text: string) {
-  let result = text;
+  let out = text;
 
   for (const name of PLAYER_NAMES) {
-    // Full word match; avoid re-wrapping if already bolded.
-    // This is intentionally simple and reliable.
-    const re = new RegExp(`\\b${name}\\b`, "g");
-    result = result.replace(re, (match, offset) => {
-      const before = result.slice(Math.max(0, offset - 2), offset);
-      const after = result.slice(offset + match.length, offset + match.length + 2);
-      if (before === "**" && after === "**") return match; // already bolded
-      return `**${match}**`;
-    });
+    // Bold name if it's a standalone word and not already surrounded by *
+    const re = new RegExp(`(^|[^*])\\b${name}\\b(?!\\*)`, "g");
+    out = out.replace(re, `$1**${name}**`);
   }
 
-  return result;
+  return out;
 }
 
 /**
- * Final formatting pass for readability:
- * - removes citation noise
- * - adds spacing between sections
- * - ensures bullets render cleanly
- * - highlights player names
+ * Make answers readable:
+ * - remove citations like [S3]
+ * - enforce clean line breaks and section spacing
+ * - normalize headings
+ * - convert inline "- " into proper list lines
+ * - bold player names (UI will render this)
  */
-function formatForChat(text: string) {
-  const cleaned = text
-    .replace(/\s*\[(?:K|M|S)\d+\]\s*/g, " ")
-    .replace(/\bFACT:\b/g, "\nFACT:\n")
-    .replace(/\bPROJECTION:\b/g, "\nPROJECTION:\n")
-    .replace(/\bNext steps\b/gi, "\nNext steps:\n")
-    .replace(/FACT\s+—/g, "\nFACT —")
-    .replace(/PROJECTION\s+—/g, "\nPROJECTION —")
-    .replace(/\s-\s/g, "\n- ")
+function formatForChat(raw: string) {
+  let t = raw || "";
+
+  // Remove citation noise
+  t = t.replace(/\s*\[(?:K|M|S)\d+\]\s*/g, " ");
+
+  // Normalize common headings / labels
+  t = t
+    .replace(/\bShort answer\b\s*:?/gi, "Short answer")
+    .replace(/\bFACT\b\s*:?/g, "FACT:")
+    .replace(/\bPROJECTION\b\s*:?/g, "PROJECTION:")
+    .replace(/\bNext steps\b\s*:?\s*\.?/gi, "Next steps:");
+
+  // Ensure headings start on their own lines
+  t = t
+    .replace(/(^|\n)\s*FACT:\s*/g, "\nFACT:\n")
+    .replace(/(^|\n)\s*PROJECTION:\s*/g, "\nPROJECTION:\n")
+    .replace(/(^|\n)\s*Next steps:\s*/gi, "\nNext steps:\n");
+
+  // Ensure common section titles get space above them
+  const sectionTitles = [
+    "Short answer",
+    "Roster snapshot",
+    "Strengths",
+    "Improvement areas",
+    "Actionable Next steps",
+    "What I cannot provide",
+  ];
+  for (const s of sectionTitles) {
+    const re = new RegExp(`(^|\\n)\\s*${s}\\s*\\n?`, "gi");
+    t = t.replace(re, `\n${s}\n`);
+  }
+
+  // Force bullets onto their own lines (handles " ... - item - item ")
+  t = t.replace(/\s-\s/g, "\n- ");
+
+  // Collapse weird spacing
+  t = t
+    .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 
-  return highlightPlayerNames(cleaned);
+  // Highlight names
+  t = highlightPlayerNames(t);
+
+  return t;
 }
 
-/* ============================
-   Position awareness (coach context)
-============================ */
+/* Optional positions context */
 const PLAYER_POSITIONS: Record<string, string[]> = {
   Eric: ["MB", "RS"],
   Brooks: ["MB", "RS"],
@@ -98,13 +108,9 @@ const PLAYER_POSITIONS: Record<string, string[]> = {
   Steven: ["S"],
 };
 
-/* ============================
-   Context retrieval (notes + rules)
-============================ */
 async function retrieveContext(question: string) {
   const supabase = supabaseService();
 
-  // Always include roster chunks
   const { data: rosterChunks } = await supabase
     .from("knowledge_chunks")
     .select("title,content")
@@ -112,7 +118,6 @@ async function retrieveContext(question: string) {
     .contains("tags", ["roster"])
     .limit(5);
 
-  // Season-specific search
   const cleaned = question.replace(/[^a-zA-Z0-9 ]/g, " ");
   const { data: searchChunks } = await supabase
     .from("knowledge_chunks")
@@ -125,9 +130,6 @@ async function retrieveContext(question: string) {
   return [...(rosterChunks ?? []), ...(searchChunks ?? [])];
 }
 
-/* ============================
-   Stats aggregation (CSV-backed)
-============================ */
 async function retrieveStatsFacts(question: string) {
   const supabase = supabaseService();
 
@@ -148,21 +150,15 @@ async function retrieveStatsFacts(question: string) {
     return Number.isFinite(n) ? n : null;
   };
 
-  // Map common questions to keys in stats JSON
-  const synonymRules: Array<{ re: RegExp; key: string; label: string }> = [
-    {
-      re: /passer rating|serve receive rating|sr rating/i,
-      key: "serve_receive_passing_rating",
-      label: "Serve-receive passing rating (0–3)",
-    },
-    { re: /\bkills?\b/i, key: "attack_kills", label: "Kills" },
-    { re: /\bdigs?\b/i, key: "digs_successful", label: "Digs" },
-    { re: /\baces?\b/i, key: "serve_aces", label: "Serve aces" },
-    { re: /serve errors?/i, key: "serve_errors", label: "Serve errors" },
-    { re: /blocks?\b/i, key: "blocks_solo", label: "Blocks (solo, if present)" },
+  const rules: Array<{ re: RegExp; key: string; label: string }> = [
+    { re: /passer rating|serve receive rating|sr rating/i, key: "serve_receive_passing_rating", label: "Serve-receive passing rating (0–3) — totals" },
+    { re: /\bkills?\b/i, key: "attack_kills", label: "Kills — totals" },
+    { re: /\bdigs?\b/i, key: "digs_successful", label: "Digs — totals" },
+    { re: /\baces?\b/i, key: "serve_aces", label: "Serve aces — totals" },
+    { re: /serve errors?/i, key: "serve_errors", label: "Serve errors — totals" },
   ];
 
-  const match = synonymRules.find((r) => r.re.test(q));
+  const match = rules.find((r) => r.re.test(q));
   if (!match) return "";
 
   const totals: Record<string, number> = {};
@@ -172,20 +168,14 @@ async function retrieveStatsFacts(question: string) {
     totals[row.player_name] = (totals[row.player_name] ?? 0) + v;
   }
 
-  const ranked = Object.entries(totals)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 10);
-
+  const ranked = Object.entries(totals).sort((a, b) => b[1] - a[1]).slice(0, 10);
   if (ranked.length === 0) return "";
 
-  let out = `FACT — ${match.label} leaders (season total)\n`;
+  let out = `FACT — ${match.label}\n`;
   for (const [player, value] of ranked) out += `- ${player}: ${value}\n`;
-  return out;
+  return out.trim();
 }
 
-/* ============================
-   OpenAI call (Responses API)
-============================ */
 async function callOpenAI(question: string, messages: Msg[] | undefined, context: string) {
   assertEnv("OPENAI_API_KEY");
   const model = process.env.OPENAI_MODEL ?? "gpt-5-mini";
@@ -198,42 +188,24 @@ You are the Coaching Assistant for MVVC 14 Black.
 Rules:
 - Use ONLY the provided context and stats facts.
 - If data is insufficient, say so clearly.
-- Be concise, coach-friendly, and structured.
-- Use clear sections and bullet points.
+- Write for coaches: structured, readable, and actionable.
+- Use headings and bullet points. Keep paragraphs short.
 - DO NOT include citation references like [S3] or [K2].
-
-Stat semantics:
-- serve_receive_passing_rating is a 0–3 scale.
-- Percentage fields may be stored as 0–1; if you see those, report as percentages.
+- When you name a player, keep the name in plain text (we will highlight in UI).
 `.trim();
 
-  // IMPORTANT: In Responses API history:
-  // user => input_text
-  // assistant => output_text
+  // Responses API: user=input_text, assistant=output_text for history
   const history = recent.map((m) => ({
     role: m.role,
-    content: [
-      {
-        type: m.role === "assistant" ? "output_text" : "input_text",
-        text: m.content,
-      },
-    ],
+    content: [{ type: m.role === "assistant" ? "output_text" : "input_text", text: m.content }],
   }));
 
   const input = [
-    {
-      role: "system",
-      content: [{ type: "input_text", text: systemText }],
-    },
+    { role: "system", content: [{ type: "input_text", text: systemText }] },
     ...history,
     {
       role: "user",
-      content: [
-        {
-          type: "input_text",
-          text: `Question: ${question}\n\nContext:\n${context}`,
-        },
-      ],
+      content: [{ type: "input_text", text: `Question: ${question}\n\nContext:\n${context}` }],
     },
   ];
 
@@ -263,13 +235,9 @@ Stat semantics:
   return text.trim() || "No answer generated.";
 }
 
-/* ============================
-   API handler
-============================ */
 export async function POST(req: Request) {
   try {
     const body = (await req.json()) as { question: string; messages?: Msg[] };
-
     const question = (body.question ?? "").trim();
     if (!question) return NextResponse.json({ error: "question is required" }, { status: 400 });
 
@@ -281,19 +249,20 @@ export async function POST(req: Request) {
     if (chunks.length) {
       context += "Notes / roster context:\n";
       for (const c of chunks) context += `- ${c.title}: ${c.content}\n`;
+      context += "\n";
     }
 
     if (statsFacts) {
-      context += `\n${statsFacts}\n`;
+      context += `${statsFacts}\n\n`;
     }
 
-    context += "\nPlayer positions:\n";
+    context += "Player positions:\n";
     for (const [p, pos] of Object.entries(PLAYER_POSITIONS)) {
       context += `- ${p}: ${pos.join(", ")}\n`;
     }
 
-    const rawAnswer = await callOpenAI(question, body.messages, context);
-    const answer = formatForChat(rawAnswer);
+    const raw = await callOpenAI(question, body.messages, context);
+    const answer = formatForChat(raw);
 
     return NextResponse.json({ answer });
   } catch (e: any) {
