@@ -69,28 +69,39 @@ export default function HomePage() {
   }
 
   return (
-    <main className="page">
-      <section className="card">
-        <header className="header">
-          <h1>MVVC Coach Copilot</h1>
-          <p>Fast, data-backed answers for coaches</p>
+    <main style={styles.page}>
+      <section style={styles.card}>
+        <header style={styles.header}>
+          <h1 style={styles.title}>MVVC Coach Copilot</h1>
+          <p style={styles.subtitle}>Fast, data-backed answers for coaches</p>
         </header>
 
-        <div className="chat">
+        <div style={styles.chat}>
           {messages.map((m, i) => (
-            <div key={i} className={`msg ${m.role}`}>
-              <div className="bubble">
+            <div
+              key={i}
+              style={{
+                ...styles.msg,
+                justifyContent: m.role === "user" ? "flex-end" : "flex-start"
+              }}
+            >
+              <div
+                style={{
+                  ...styles.bubble,
+                  ...(m.role === "user" ? styles.userBubble : {})
+                }}
+              >
                 <strong>{m.role === "user" ? "You" : "Assistant"}</strong>
-                <div className="text">{m.content}</div>
+                <div style={styles.text}>{m.content}</div>
               </div>
             </div>
           ))}
 
           {loading && (
-            <div className="msg assistant">
-              <div className="bubble">
+            <div style={styles.msg}>
+              <div style={styles.bubble}>
                 <strong>Assistant</strong>
-                <div className="text">Analyzing…</div>
+                <div style={styles.text}>Analyzing…</div>
               </div>
             </div>
           )}
@@ -98,15 +109,20 @@ export default function HomePage() {
           <div ref={bottomRef} />
         </div>
 
-        <div className="suggested">
+        <div style={styles.suggested}>
           {SUGGESTED.map((q) => (
-            <button key={q} onClick={() => sendQuestion(q)} disabled={loading}>
+            <button
+              key={q}
+              style={styles.chip}
+              onClick={() => sendQuestion(q)}
+              disabled={loading}
+            >
               {q}
             </button>
           ))}
         </div>
 
-        <div className="inputBox">
+        <div style={styles.inputBox}>
           <textarea
             placeholder="Ask a question…"
             value={input}
@@ -118,125 +134,113 @@ export default function HomePage() {
               }
             }}
             disabled={loading}
+            style={styles.textarea}
           />
-          <button onClick={() => sendQuestion()} disabled={loading || !input.trim()}>
+          <button
+            onClick={() => sendQuestion()}
+            disabled={loading || !input.trim()}
+            style={styles.sendButton}
+          >
             Send
           </button>
         </div>
 
-        {error && <div className="error">{error}</div>}
+        {error && <div style={styles.error}>{error}</div>}
       </section>
-
-      <style jsx>{`
-        .page {
-          min-height: 100vh;
-          background: linear-gradient(135deg, #0f172a, #020617);
-          display: flex;
-          justify-content: center;
-          padding: 16px;
-        }
-
-        .card {
-          background: white;
-          width: 100%;
-          max-width: 700px;
-          border-radius: 14px;
-          padding: 16px;
-          display: flex;
-          flex-direction: column;
-        }
-
-        .header h1 {
-          margin: 0;
-          font-size: 1.4rem;
-        }
-
-        .header p {
-          margin: 4px 0 12px;
-          color: #475569;
-          font-size: 0.9rem;
-        }
-
-        .chat {
-          flex: 1;
-          overflow-y: auto;
-          padding: 8px 0;
-        }
-
-        .msg {
-          display: flex;
-          margin-bottom: 10px;
-        }
-
-        .msg.user {
-          justify-content: flex-end;
-        }
-
-        .bubble {
-          background: #f1f5f9;
-          border-radius: 12px;
-          padding: 10px;
-          max-width: 85%;
-          font-size: 0.95rem;
-        }
-
-        .msg.user .bubble {
-          background: #2563eb;
-          color: white;
-        }
-
-        .text {
-          margin-top: 4px;
-          white-space: pre-wrap;
-        }
-
-        .suggested {
-          display: flex;
-          gap: 6px;
-          flex-wrap: wrap;
-          margin: 10px 0;
-        }
-
-        .suggested button {
-          font-size: 0.75rem;
-          padding: 6px 10px;
-          border-radius: 999px;
-          border: 1px solid #cbd5f5;
-          background: #f8fafc;
-          cursor: pointer;
-        }
-
-        .inputBox {
-          display: flex;
-          gap: 8px;
-          margin-top: 6px;
-        }
-
-        textarea {
-          flex: 1;
-          resize: none;
-          padding: 10px;
-          border-radius: 10px;
-          border: 1px solid #cbd5f5;
-          font-size: 0.9rem;
-        }
-
-        .inputBox button {
-          padding: 10px 14px;
-          border-radius: 10px;
-          border: none;
-          background: #2563eb;
-          color: white;
-          font-weight: 600;
-          cursor: pointer;
-        }
-
-        .error {
-          color: #dc2626;
-          font-size: 0.85rem;
-          margin-top: 6px;
-        }
-      `}</style>
     </main>
   );
 }
+
+const styles: Record<string, React.CSSProperties> = {
+  page: {
+    minHeight: "100vh",
+    display: "flex",
+    justifyContent: "center",
+    padding: 16
+  },
+  card: {
+    background: "#ffffff",
+    width: "100%",
+    maxWidth: 720,
+    borderRadius: 16,
+    padding: 16,
+    display: "flex",
+    flexDirection: "column"
+  },
+  header: {
+    marginBottom: 12
+  },
+  title: {
+    margin: 0,
+    fontSize: "1.4rem"
+  },
+  subtitle: {
+    margin: "4px 0 0",
+    color: "#475569",
+    fontSize: "0.9rem"
+  },
+  chat: {
+    flex: 1,
+    overflowY: "auto",
+    margin: "12px 0"
+  },
+  msg: {
+    display: "flex",
+    marginBottom: 10
+  },
+  bubble: {
+    background: "#f1f5f9",
+    borderRadius: 12,
+    padding: 10,
+    maxWidth: "85%",
+    fontSize: "0.95rem"
+  },
+  userBubble: {
+    background: "#2563eb",
+    color: "#ffffff"
+  },
+  text: {
+    marginTop: 4,
+    whiteSpace: "pre-wrap"
+  },
+  suggested: {
+    display: "flex",
+    gap: 6,
+    flexWrap: "wrap",
+    marginBottom: 8
+  },
+  chip: {
+    fontSize: "0.75rem",
+    padding: "6px 10px",
+    borderRadius: 999,
+    border: "1px solid #cbd5f5",
+    background: "#f8fafc",
+    cursor: "pointer"
+  },
+  inputBox: {
+    display: "flex",
+    gap: 8
+  },
+  textarea: {
+    flex: 1,
+    resize: "none",
+    padding: 10,
+    borderRadius: 10,
+    border: "1px solid #cbd5f5",
+    fontSize: "0.9rem"
+  },
+  sendButton: {
+    padding: "10px 14px",
+    borderRadius: 10,
+    border: "none",
+    background: "#2563eb",
+    color: "#ffffff",
+    fontWeight: 600,
+    cursor: "pointer"
+  },
+  error: {
+    marginTop: 8,
+    color: "#dc2626",
+    fontSize: "0.85rem"
+  }
+};
