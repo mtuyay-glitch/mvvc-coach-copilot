@@ -8,14 +8,11 @@ type Msg = {
 };
 
 const SUGGESTED = [
-  "Who has the best passer rating?",
-  "Who leads the team in kills?",
-  "Who leads in digs?",
-  "Rank the best passers top to bottom.",
+  "Summarize the season - key moments, strengths, improvement areas.",
   "Best projected spring lineup?",
-  "Should we protect Jayden in serve receive using Bodhi?",
-  "Who improved vs regressed this season?",
-  "Who is the best opposite on the team?"
+  "Who has the best passer rating?",
+  "Which types of opponets do we struggle against?",
+  "Show me the average kill % per month"
 ];
 
 export default function HomePage() {
@@ -23,7 +20,7 @@ export default function HomePage() {
     {
       role: "assistant",
       content:
-        "Ask me anything about MVVC 14 Black — stats, lineups, passing, trends, or player performance."
+        "I’m your Coaching Assistant for MVVC 14 Black. Ask me about stats, lineups, passing, trends, or player performance."
     }
   ]);
   const [input, setInput] = useState("");
@@ -44,7 +41,6 @@ export default function HomePage() {
     setError(null);
     setInput("");
 
-    // ✅ Force correct Msg[] typing so TS doesn't widen role to string
     const nextMessages: Msg[] = [
       ...messages,
       { role: "user" as const, content: question }
@@ -98,7 +94,9 @@ export default function HomePage() {
                   ...(m.role === "user" ? styles.userBubble : {})
                 }}
               >
-                <strong>{m.role === "user" ? "You" : "Assistant"}</strong>
+                <strong>
+                  {m.role === "user" ? "You" : "Coaching Assistant"}
+                </strong>
                 <div style={styles.text}>{m.content}</div>
               </div>
             </div>
@@ -107,7 +105,7 @@ export default function HomePage() {
           {loading && (
             <div style={styles.msg}>
               <div style={styles.bubble}>
-                <strong>Assistant</strong>
+                <strong>Coaching Assistant</strong>
                 <div style={styles.text}>Analyzing…</div>
               </div>
             </div>
