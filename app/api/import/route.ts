@@ -16,7 +16,9 @@ function csvToRows(text: string) {
   }
   return rows;
 }
-
+export async function GET() {
+  return NextResponse.json({ ok: true, route: "/api/import", methods: ["GET", "POST"] });
+}
 export async function POST(req: Request) {
   const form = await req.formData();
 
