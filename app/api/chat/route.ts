@@ -23,13 +23,51 @@ function assertEnv(name: string) {
 }
 
 /**
+ * Player name highlighting (subtle)
+ * - wraps known player names in **bold**
+ * - avoids double-bolding
+ */
+const PLAYER_NAMES = [
+  "Eric",
+  "Brooks",
+  "Cooper",
+  "Troy",
+  "Jayden",
+  "Anson",
+  "Bodhi",
+  "Allen",
+  "Koa",
+  "Ryota",
+  "Steven",
+];
+
+function highlightPlayerNames(text: string) {
+  let result = text;
+
+  for (const name of PLAYER_NAMES) {
+    // Full word match; avoid re-wrapping if already bolded.
+    // This is intentionally simple and reliable.
+    const re = new RegExp(`\\b${name}\\b`, "g");
+    result = result.replace(re, (match, offset) => {
+      const before = result.slice(Math.max(0, offset - 2), offset);
+      const after = result.slice(offset + match.length, offset + match.length + 2);
+      if (before === "**" && after === "**") return match; // already bolded
+      return `**${match}**`;
+    });
+  }
+
+  return result;
+}
+
+/**
  * Final formatting pass for readability:
  * - removes citation noise
  * - adds spacing between sections
  * - ensures bullets render cleanly
+ * - highlights player names
  */
 function formatForChat(text: string) {
-  return text
+  const cleaned = text
     .replace(/\s*\[(?:K|M|S)\d+\]\s*/g, " ")
     .replace(/\bFACT:\b/g, "\nFACT:\n")
     .replace(/\bPROJECTION:\b/g, "\nPROJECTION:\n")
@@ -39,6 +77,8 @@ function formatForChat(text: string) {
     .replace(/\s-\s/g, "\n- ")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+
+  return highlightPlayerNames(cleaned);
 }
 
 /* ============================
@@ -55,7 +95,7 @@ const PLAYER_POSITIONS: Record<string, string[]> = {
   Allen: ["OPP"],
   Koa: ["S", "L", "DS"],
   Ryota: ["DS", "L"],
-  Steven: ["S"]
+  Steven: ["S"],
 };
 
 /* ============================
@@ -64,6 +104,7 @@ const PLAYER_POSITIONS: Record<string, string[]> = {
 async function retrieveContext(question: string) {
   const supabase = supabaseService();
 
+  // Always include roster chunks
   const { data: rosterChunks } = await supabase
     .from("knowledge_chunks")
     .select("title,content")
@@ -71,6 +112,7 @@ async function retrieveContext(question: string) {
     .contains("tags", ["roster"])
     .limit(5);
 
+  // Season-specific search
   const cleaned = question.replace(/[^a-zA-Z0-9 ]/g, " ");
   const { data: searchChunks } = await supabase
     .from("knowledge_chunks")
@@ -108,11 +150,16 @@ async function retrieveStatsFacts(question: string) {
 
   // Map common questions to keys in stats JSON
   const synonymRules: Array<{ re: RegExp; key: string; label: string }> = [
-    { re: /passer rating|serve receive rating|sr rating/i, key: "serve_receive_passing_rating", label: "Serve-receive passing rating (0–3)" },
+    {
+      re: /passer rating|serve receive rating|sr rating/i,
+      key: "serve_receive_passing_rating",
+      label: "Serve-receive passing rating (0–3)",
+    },
     { re: /\bkills?\b/i, key: "attack_kills", label: "Kills" },
     { re: /\bdigs?\b/i, key: "digs_successful", label: "Digs" },
     { re: /\baces?\b/i, key: "serve_aces", label: "Serve aces" },
-    { re: /serve errors?/i, key: "serve_errors", label: "Serve errors" }
+    { re: /serve errors?/i, key: "serve_errors", label: "Serve errors" },
+    { re: /blocks?\b/i, key: "blocks_solo", label: "Blocks (solo, if present)" },
   ];
 
   const match = synonymRules.find((r) => r.re.test(q));
@@ -137,7 +184,7 @@ async function retrieveStatsFacts(question: string) {
 }
 
 /* ============================
-   OpenAI call (FIXED for Responses API)
+   OpenAI call (Responses API)
 ============================ */
 async function callOpenAI(question: string, messages: Msg[] | undefined, context: string) {
   assertEnv("OPENAI_API_KEY");
@@ -160,7 +207,7 @@ Stat semantics:
 - Percentage fields may be stored as 0–1; if you see those, report as percentages.
 `.trim();
 
-  // ✅ IMPORTANT: In Responses API history:
+  // IMPORTANT: In Responses API history:
   // user => input_text
   // assistant => output_text
   const history = recent.map((m) => ({
@@ -168,15 +215,15 @@ Stat semantics:
     content: [
       {
         type: m.role === "assistant" ? "output_text" : "input_text",
-        text: m.content
-      }
-    ]
+        text: m.content,
+      },
+    ],
   }));
 
   const input = [
     {
       role: "system",
-      content: [{ type: "input_text", text: systemText }]
+      content: [{ type: "input_text", text: systemText }],
     },
     ...history,
     {
@@ -184,19 +231,19 @@ Stat semantics:
       content: [
         {
           type: "input_text",
-          text: `Question: ${question}\n\nContext:\n${context}`
-        }
-      ]
-    }
+          text: `Question: ${question}\n\nContext:\n${context}`,
+        },
+      ],
+    },
   ];
 
   const res = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
     },
-    body: JSON.stringify({ model, input })
+    body: JSON.stringify({ model, input }),
   });
 
   if (!res.ok) {
