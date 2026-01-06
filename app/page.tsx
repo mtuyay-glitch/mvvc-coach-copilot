@@ -1,132 +1,155 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
-import { supabaseBrowser } from "../lib/supabaseClient";
+import { useState } from "react";
 
-type Msg = { role: "user" | "assistant"; content: string };
-
-export default function HomePage() {
-  const supabase = useMemo(() => supabaseBrowser(), []);
-  const [sessionEmail, setSessionEmail] = useState<string | null>(null);
-
-// Team and season are now fixed server-side
+export default function Home() {
   const [question, setQuestion] = useState("");
-  const [msgs, setMsgs] = useState<Msg[]>([
-    { role: "assistant", content: "Ask a question (e.g., 'Best spring lineup?' or 'Protect Jayden in SR using Bodhi?'). I will cite the retrieved facts." }
-  ]);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [answer, setAnswer] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
 
-  useEffect(() => {
-    supabase.auth.getUser().then(({ data }) => {
-      setSessionEmail(data.user?.email ?? null);
-    });
-  }, [supabase]);
+  async function askQuestion() {
+    if (!question.trim()) return;
 
-  async function signIn(email: string) {
-    setError(null);
-    const { error } = await supabase.auth.signInWithOtp({
-      email,
-      options: { emailRedirectTo: window.location.href }
-    });
-    if (error) setError(error.message);
-    else setMsgs((m) => [{ role: "assistant", content: "Check your email for the magic link, then come back here." }, ...m]);
-  }
-
-  async function signOut() {
-    await supabase.auth.signOut();
-    setSessionEmail(null);
-    setMsgs([{ role: "assistant", content: "Signed out." }]);
-  }
-
-  async function ask() {
-    const q = question.trim();
-    if (!q) return;
-    setBusy(true);
-    setError(null);
-    setQuestion("");
-    setMsgs((m) => [...m, { role: "user", content: q }]);
+    setLoading(true);
+    setError("");
+    setAnswer("");
 
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
-        headers: { "content-type": "application/json" },
-body: JSON.stringify({ question: q })      });
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question }),
+      });
+
       const data = await res.json();
-      if (!res.ok) throw new Error(data?.error ?? "Request failed");
-      setMsgs((m) => [...m, { role: "assistant", content: data.answer }]);
-    } catch (e: any) {
-      setError(e.message ?? String(e));
+
+      if (!res.ok) {
+        throw new Error(data.error || "Something went wrong");
+      }
+
+      setAnswer(data.answer);
+    } catch (err: any) {
+      setError(err.message || "Failed to get answer");
     } finally {
-      setBusy(false);
+      setLoading(false);
     }
   }
 
   return (
-    <div style={{ maxWidth: 980, margin: "0 auto", padding: 20 }}>
-      <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
-        <div>
-          <div style={{ fontSize: 22, fontWeight: 700 }}>MVVC Coach Copilot (MVP)</div>
-          <div style={{ opacity: 0.7, marginTop: 4 }}>Private, data-backed answers for coaches.</div>
-        </div>
+    <main style={styles.page}>
+      <div style={styles.card}>
+        <h1 style={styles.title}>MVVC 14 Black — Coach Assistant</h1>
+        <p style={styles.subtitle}>
+          Ask questions about lineups, stats, passing, rotations, or player performance.
+        </p>
 
-        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-          {sessionEmail ? (
-            <>
-              <div style={{ fontSize: 13, opacity: 0.8 }}>{sessionEmail}</div>
-              <button onClick={signOut}>Sign out</button>
-            </>
-          ) : (
-            <EmailLogin onSubmit={signIn} />
-          )}
-        </div>
-      </header>
+        <textarea
+          placeholder="Example: Who has the best passer rating?"
+          value={question}
+          onChange={(e) => setQuestion(e.target.value)}
+          rows={3}
+          style={styles.textarea}
+        />
 
+        <button
+          onClick={askQuestion}
+          disabled={loading}
+          style={{
+            ...styles.button,
+            opacity: loading ? 0.7 : 1,
+          }}
+        >
+          {loading ? "Analyzing…" : "Ask Coach Assistant"}
+        </button>
 
+        {error && <p style={styles.error}>{error}</p>}
 
-      <main style={{ marginTop: 16, border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
-        <div style={{ height: 440, overflow: "auto", padding: 8, background: "#fafafa", borderRadius: 10 }}>
-          {msgs.map((m, i) => (
-            <div key={i} style={{ marginBottom: 12 }}>
-              <div style={{ fontSize: 12, opacity: 0.65 }}>{m.role.toUpperCase()}</div>
-              <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.35 }}>{m.content}</div>
-            </div>
-          ))}
-        </div>
-
-        <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-          <input
-            style={{ flex: 1 }}
-            value={question}
-            onChange={(e) => setQuestion(e.target.value)}
-            placeholder="Ask a question…"
-            onKeyDown={(e) => { if (e.key === "Enter") ask(); }}
-            disabled={busy}
-          />
-<button onClick={ask} disabled={busy || !sessionEmail}>            {busy ? "Thinking…" : "Ask"}
-          </button>
-        </div>
-
-        {error && <div style={{ marginTop: 10, color: "crimson" }}>{error}</div>}
-        {!sessionEmail && <div style={{ marginTop: 10, opacity: 0.7 }}>Sign in to ask questions.</div>}
-      </main>
-
-      <footer style={{ marginTop: 14, fontSize: 12, opacity: 0.75 }}>
-        MVP note: this starter uses server-side retrieval from Supabase + OpenAI Responses API.
-      </footer>
-    </div>
+        {answer && (
+          <div style={styles.answerBox}>
+            <h2 style={styles.answerTitle}>Answer</h2>
+            <p style={styles.answerText}>{answer}</p>
+          </div>
+        )}
+      </div>
+    </main>
   );
 }
 
-function EmailLogin({ onSubmit }: { onSubmit: (email: string) => Promise<void> }) {
-  const [email, setEmail] = useState("");
-  return (
-    <form
-      onSubmit={(e) => { e.preventDefault(); onSubmit(email); }}
-      style={{ display: "flex", gap: 8, alignItems: "center" }}
-    >
-      <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="coach@email.com" />
-      <button type="submit">Magic link</button>
-    </form>
-  );
-}
+const styles: Record<string, React.CSSProperties> = {
+  page: {
+    minHeight: "100vh",
+    background: "linear-gradient(135deg, #0f172a, #020617)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: "16px",
+  },
+  card: {
+    background: "#ffffff",
+    borderRadius: "14px",
+    padding: "20px",
+    width: "100%",
+    maxWidth: "520px",
+    boxShadow: "0 10px 30px rgba(0,0,0,0.25)",
+  },
+  title: {
+    margin: 0,
+    fontSize: "1.4rem",
+    fontWeight: 700,
+    color: "#020617",
+  },
+  subtitle: {
+    marginTop: "6px",
+    marginBottom: "16px",
+    fontSize: "0.95rem",
+    color: "#475569",
+  },
+  textarea: {
+    width: "100%",
+    padding: "12px",
+    fontSize: "1rem",
+    borderRadius: "10px",
+    border: "1px solid #cbd5f5",
+    outline: "none",
+    resize: "none",
+    marginBottom: "12px",
+  },
+  button: {
+    width: "100%",
+    padding: "14px",
+    fontSize: "1rem",
+    fontWeight: 600,
+    backgroundColor: "#2563eb",
+    color: "#ffffff",
+    border: "none",
+    borderRadius: "10px",
+    cursor: "pointer",
+  },
+  error: {
+    marginTop: "12px",
+    color: "#dc2626",
+    fontSize: "0.9rem",
+  },
+  answerBox: {
+    marginTop: "20px",
+    padding: "16px",
+    background: "#f8fafc",
+    borderRadius: "10px",
+    border: "1px solid #e2e8f0",
+  },
+  answerTitle: {
+    margin: 0,
+    marginBottom: "6px",
+    fontSize: "1rem",
+    fontWeight: 600,
+    color: "#020617",
+  },
+  answerText: {
+    margin: 0,
+    fontSize: "0.95rem",
+    lineHeight: 1.5,
+    color: "#020617",
+    whiteSpace: "pre-wrap",
+  },
+};
