@@ -8,10 +8,15 @@ type Msg = {
 };
 
 const SUGGESTED = [
+  "Summarize the season - key moments, strengths, improvement areas.",
   "Who has the best passer rating?",
   "Who leads the team in kills?",
+  "Who leads in digs?",
+  "Rank the best passers top to bottom.",
   "Best projected spring lineup?",
-  "What were the key moments of the season?"
+  "Should we protect Jayden in serve receive using Bodhi?",
+  "Who improved vs regressed this season?",
+  "Who is the best opposite on the team?"
 ];
 
 function escapeHtml(s: string) {
@@ -26,14 +31,14 @@ function escapeHtml(s: string) {
 /**
  * Very small "markdown-ish" renderer:
  * - **bold**
- * - headings like "FACT:" / "PROJECTION:" / "Next steps:" / "Roster snapshot"
+ * - underlined headings
  * - bullet lists "- item"
  * - paragraphs with spacing
  */
 function toNiceHtml(raw: string) {
   const text = escapeHtml(raw).replaceAll("\r\n", "\n");
-
   const lines = text.split("\n");
+
   let html = "";
   let inList = false;
 
@@ -44,47 +49,70 @@ function toNiceHtml(raw: string) {
     }
   };
 
+  // Treat these as headings even if the model doesn't add colons.
+  const commonHeadings = [
+    "Short answer",
+    "Roster snapshot",
+    "Strengths",
+    "Improvement areas",
+    "Actionable Next steps",
+    "What I cannot provide",
+    "Best Projected Starting Six",
+    "Libero / Defensive Specialist"
+  ];
+
   const isHeading = (line: string) => {
     const t = line.trim();
     if (!t) return false;
+
+    // Explicit headings
     if (/^(FACT:|PROJECTION:|Next steps:)/i.test(t)) return true;
-    if (
-      /^(Short answer|Roster snapshot|Strengths|Improvement areas|Actionable Next steps|What I cannot provide)/i.test(
-        t
-      )
-    )
-      return true;
-    if (/^[A-Za-z].{0,60}—/.test(t)) return true;
+
+    // Known section titles
+    if (commonHeadings.some((h) => h.toLowerCase() === t.toLowerCase())) return true;
+
+    // Generic "section title" heuristic:
+    // - not a bullet
+    // - short-ish
+    // - mostly Title Case words and separators (/, &, -, —)
+    if (t.length <= 70 && !t.startsWith("- ")) {
+      const titleLike = /^[A-Z][A-Za-z0-9’'()\/&\-\s—]+$/.test(t);
+      const notSentence = !/[.!?]$/.test(t);
+      if (titleLike && notSentence) return true;
+    }
+
     return false;
   };
 
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const t = line.trim();
+    const t = lines[i].trim();
 
+    // Blank line => spacing
     if (!t) {
       closeList();
       html += `<div style="height:10px"></div>`;
       continue;
     }
 
+    // Bullets
     if (t.startsWith("- ")) {
       if (!inList) {
         closeList();
         inList = true;
         html += `<ul class="niceList">`;
       }
-      const item = t.slice(2);
-      html += `<li>${item}</li>`;
+      html += `<li>${t.slice(2)}</li>`;
       continue;
     }
 
+    // Headings (UNDERLINED)
     if (isHeading(t)) {
       closeList();
-      html += `<div class="niceHeading">${t}</div>`;
+      html += `<div class="niceHeading"><span class="headingUnderline">${t}</span></div>`;
       continue;
     }
 
+    // Normal paragraph
     closeList();
     html += `<div class="nicePara">${t}</div>`;
   }
@@ -275,7 +303,8 @@ export default function HomePage() {
 
       <style>{`
         .niceChat { margin-top: 6px; line-height: 1.55; }
-        .niceHeading { font-weight: 800; margin-top: 8px; }
+        .niceHeading { font-weight: 800; margin-top: 10px; }
+        .headingUnderline { text-decoration: underline; text-underline-offset: 4px; }
         .nicePara { margin-top: 8px; }
         .niceList { margin: 10px 0 0 18px; padding: 0; }
         .niceList li { margin: 7px 0; }
