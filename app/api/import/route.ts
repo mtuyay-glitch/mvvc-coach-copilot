@@ -3,27 +3,6 @@ import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
-function csvToRows(text: string) {
-  const lines = text.split(/\r?\n/).filter(Boolean);
-  const header = lines[0].split(",").map((s) => s.trim());
-  const rows = [];
-  for (let i = 1; i < lines.length; i++) {
-    // simple CSV split (works if your CSV has no commas inside quoted fields)
-    const values = lines[i].split(",").map((s) => s.trim());
-    const obj: any = {};
-    header.forEach((h, idx) => (obj[h] = values[idx] ?? ""));
-    rows.push(obj);
-  }
-  return rows;
-}
-export async function GET() {
-  return NextResponse.json({ ok: true, route: "/api/import", methods: ["GET", "POST"] });
-}
-import { NextResponse } from "next/server";
-import { createClient } from "@supabase/supabase-js";
-
-export const runtime = "nodejs";
-
 export async function GET() {
   return NextResponse.json({ ok: true, route: "/api/import", methods: ["GET", "POST"] });
 }
@@ -78,10 +57,12 @@ export async function POST(req: Request) {
     const rows = csvToRows(text);
 
     if (rows.length === 0) {
-      return NextResponse.json({ error: "CSV parsed 0 data rows (check headers / formatting)" }, { status: 400 });
+      return NextResponse.json(
+        { error: "CSV parsed 0 data rows (check headers / formatting)" },
+        { status: 400 }
+      );
     }
 
-    // Expect at least: Name/Player, GameDate, Opponent, SourceFile (best effort)
     let rowsInserted = 0;
 
     for (const r of rows) {
@@ -90,10 +71,9 @@ export async function POST(req: Request) {
 
       const gameDate = (r["GameDate"] || "").trim() || null;
       const opponent = (r["Opponent"] || "").trim() || null;
-      const sourceFile = (r["SourceFile"] || "").trim() || (file.name ?? null);
+      const sourceFile = (r["SourceFile"] || "").trim() || file.name || null;
       const position = (r["Position"] || "").trim() || null;
 
-      // Store entire row as JSON stats, minus the identity columns
       const { Name, Player, GameDate, Opponent, SourceFile, Position, ...rest } = r;
 
       const { error } = await supabase.from("player_game_stats").insert({
