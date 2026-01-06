@@ -8,15 +8,10 @@ type Msg = {
 };
 
 const SUGGESTED = [
-  "Summarize the season - key moments, strengths, improvement areas.",
   "Who has the best passer rating?",
   "Who leads the team in kills?",
-  "Who leads in digs?",
-  "Rank the best passers top to bottom.",
   "Best projected spring lineup?",
-  "Should we protect Jayden in serve receive using Bodhi?",
-  "Who improved vs regressed this season?",
-  "Who is the best opposite on the team?"
+  "What were the key moments of the season?"
 ];
 
 function escapeHtml(s: string) {
