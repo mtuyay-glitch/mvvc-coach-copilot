@@ -104,8 +104,7 @@ export default async function ResultsPage() {
       </header>
 
       {/* Summary cards */}
-      <section style={styles.grid}>
-        <div style={styles.card}>
+<section style={styles.grid} className="summary-grid">        <div style={styles.card}>
           <div style={styles.cardLabel}>Overall record</div>
           <div style={styles.bigStat}>
             {wins}-{losses}
