@@ -1,425 +1,348 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
-type Msg = {
-  role: "user" | "assistant";
-  content: string;
+type Role = "user" | "assistant";
+
+type Message = {
+  id: string;
+  role: Role;
+  text: string;
 };
 
-const SUGGESTED = [
-  "Show me the statistical leaders across key categories.",
-  "Using a 6-2 offense, give me a projected lineup.",
-  "Recap our season so far."
-];
-
-function escapeHtml(s: string) {
-  return s
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+function uid() {
+  return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
-/**
- * Very small "markdown-ish" renderer:
- * - **bold**
- * - underlined headings
- * - bullet lists "- item"
- * - paragraphs with spacing
- */
-function toNiceHtml(raw: string) {
-  const text = escapeHtml(raw).replaceAll("\r\n", "\n");
-  const lines = text.split("\n");
-
-  let html = "";
-  let inList = false;
-
-  const closeList = () => {
-    if (inList) {
-      html += "</ul>";
-      inList = false;
-    }
-  };
-
-  // Treat these as headings even if the model doesn't add colons.
-  const commonHeadings = [
-    "Short answer",
-    "Roster snapshot",
-    "Strengths",
-    "Improvement areas",
-    "Actionable Next steps",
-    "What I cannot provide",
-    "Best Projected Starting Six",
-    "Libero / Defensive Specialist"
-  ];
-
-  const isHeading = (line: string) => {
-    const t = line.trim();
-    if (!t) return false;
-
-    // Explicit headings
-    if (/^(FACT:|PROJECTION:|Next steps:)/i.test(t)) return true;
-
-    // Known section titles
-    if (commonHeadings.some((h) => h.toLowerCase() === t.toLowerCase())) return true;
-
-    // Generic "section title" heuristic:
-    // - not a bullet
-    // - short-ish
-    // - mostly Title Case words and separators (/, &, -, —)
-    if (t.length <= 70 && !t.startsWith("- ")) {
-      const titleLike = /^[A-Z][A-Za-z0-9’'()\/&\-\s—]+$/.test(t);
-      const notSentence = !/[.!?]$/.test(t);
-      if (titleLike && notSentence) return true;
-    }
-
-    return false;
-  };
-
-  for (let i = 0; i < lines.length; i++) {
-    const t = lines[i].trim();
-
-    // Blank line => spacing
-    if (!t) {
-      closeList();
-      html += `<div style="height:10px"></div>`;
-      continue;
-    }
-
-    // Bullets
-    if (t.startsWith("- ")) {
-      if (!inList) {
-        closeList();
-        inList = true;
-        html += `<ul class="niceList">`;
-      }
-      html += `<li>${t.slice(2)}</li>`;
-      continue;
-    }
-
-    // Headings (UNDERLINED)
-    if (isHeading(t)) {
-      closeList();
-      html += `<div class="niceHeading"><span class="headingUnderline">${t}</span></div>`;
-      continue;
-    }
-
-    // Normal paragraph
-    closeList();
-    html += `<div class="nicePara">${t}</div>`;
-  }
-
-  closeList();
-
-  // Bold: **text**
-  html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-
-  return html;
+function formatAssistantLabel() {
+  // If you want to rename the assistant label in the UI, change this.
+  return "Volleyball Guru";
 }
 
-function AssistantLabel() {
-  return (
-    <div style={styles.assistantLabel}>
-      <img
-        src="/mvvc-logo.png"
-        alt="MVVC"
-        width={18}
-        height={18}
-        style={styles.assistantLogo}
-      />
-      <span>Coaching Assistant</span>
-    </div>
-  );
-}
-
-export default function HomePage() {
-  const [messages, setMessages] = useState<Msg[]>([
+export default function Page() {
+  // Chat transcript shown on screen
+  const [messages, setMessages] = useState<Message[]>([
     {
+      id: uid(),
       role: "assistant",
-      content:
-        "I’m your Coaching Assistant for MVVC 14 Black.\n\nAsk me about stats, lineups, passing, trends, strengths, or improvement areas."
-    }
+      text:
+        `I’m ${formatAssistantLabel()} for MVVC 14 Black.\n\n` +
+        `Ask me about stats, month-over-month trends, lineup ideas (including 6–2), strengths/weaknesses, tactics vs opponents, or player development.`,
+    },
   ]);
-  const [input, setInput] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
+  // The current input box value
+  const [input, setInput] = useState("");
+
+  // Loading flag for UI + disabling button
+  const [isSending, setIsSending] = useState(false);
+
+  // Thread id = “conversation memory key”
+  const [threadId, setThreadId] = useState<string | null>(null);
+
+  // For auto-scroll to bottom when new messages arrive
   const bottomRef = useRef<HTMLDivElement | null>(null);
 
+  // LocalStorage key (you can rename if you want)
+  const THREAD_STORAGE_KEY = "mvvc_thread_id";
+
+  // On first load, restore thread_id (so conversation continues after refresh)
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(THREAD_STORAGE_KEY);
+      if (saved) setThreadId(saved);
+    } catch {
+      // ignore (private mode / blocked storage)
+    }
+  }, []);
+
+  // Auto-scroll when messages change
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, loading]);
+  }, [messages.length]);
 
-  async function sendQuestion(text?: string) {
-    const question = (text ?? input).trim();
-    if (!question || loading) return;
+  const canSend = useMemo(() => {
+    return input.trim().length > 0 && !isSending;
+  }, [input, isSending]);
 
-    setLoading(true);
-    setError(null);
+  async function sendMessage() {
+    const question = input.trim();
+    if (!question || isSending) return;
+
+    // 1) Optimistically add the user's message to the UI immediately
+    const userMsg: Message = { id: uid(), role: "user", text: question };
+    setMessages((prev) => [...prev, userMsg]);
     setInput("");
+    setIsSending(true);
 
-    const nextMessages: Msg[] = [
-      ...messages,
-      { role: "user" as const, content: question }
-    ];
-    setMessages(nextMessages);
+    // 2) Add a temporary "thinking..." assistant message
+    const thinkingId = uid();
+    setMessages((prev) => [
+      ...prev,
+      { id: thinkingId, role: "assistant", text: "Thinking…" },
+    ]);
 
     try {
+      // 3) Call your backend
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           question,
-          messages: nextMessages
-        })
+          thread_id: threadId, // key change: send thread_id if we have it
+        }),
       });
 
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Request failed");
 
-      setMessages((m): Msg[] => [
-        ...m,
-        { role: "assistant" as const, content: data.answer }
-      ]);
+      if (!res.ok) {
+        const errText =
+          typeof data?.error === "string"
+            ? data.error
+            : `Request failed (${res.status})`;
+        throw new Error(errText);
+      }
+
+      // 4) If backend returned a thread_id, store it for next requests
+      // (First message usually creates it)
+      if (data?.thread_id && typeof data.thread_id === "string") {
+        const newThreadId = data.thread_id;
+        if (newThreadId !== threadId) {
+          setThreadId(newThreadId);
+          try {
+            localStorage.setItem(THREAD_STORAGE_KEY, newThreadId);
+          } catch {
+            // ignore
+          }
+        }
+      }
+
+      // 5) Replace "Thinking..." with the real assistant answer
+      const answer =
+        typeof data?.answer === "string" && data.answer.trim()
+          ? data.answer.trim()
+          : "No answer generated.";
+
+      setMessages((prev) =>
+        prev.map((m) => (m.id === thinkingId ? { ...m, text: answer } : m))
+      );
     } catch (e: any) {
-      setError(e.message || "Something went wrong");
+      const msg =
+        typeof e?.message === "string"
+          ? e.message
+          : "Something went wrong calling /api/chat.";
+
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === thinkingId
+            ? {
+                ...m,
+                text:
+                  `Sorry — I hit an error.\n\n` +
+                  `Details: ${msg}\n\n` +
+                  `Tip: Check Vercel logs (Function Logs) + confirm OPENAI_API_KEY is set.`,
+              }
+            : m
+        )
+      );
     } finally {
-      setLoading(false);
+      setIsSending(false);
+    }
+  }
+
+  function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    // Enter to send, Shift+Enter to add a new line
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  }
+
+  function clearThread() {
+    // This resets the conversation in the UI + removes thread_id
+    setMessages([
+      {
+        id: uid(),
+        role: "assistant",
+        text:
+          `New conversation started.\n\n` +
+          `Ask me anything about MVVC 14 Black (stats, lineups, trends, development, tactics).`,
+      },
+    ]);
+    setThreadId(null);
+    try {
+      localStorage.removeItem(THREAD_STORAGE_KEY);
+    } catch {
+      // ignore
     }
   }
 
   return (
-    <main style={styles.page}>
-      <section style={styles.card}>
-        <header style={styles.header}>
-          <div style={styles.headerRow}>
-            <img
-              src="/mvvc-logo.png"
-              alt="MVVC"
-              width={28}
-              height={28}
-              style={styles.headerLogo}
-            />
-            <div>
-              <h1 style={styles.title}>MVVC Coach Copilot</h1>
-              <p style={styles.subtitle}>
-                Fast, coach-friendly answers from your team stats
-              </p>
-            </div>
+    <main
+      style={{
+        minHeight: "100vh",
+        display: "flex",
+        flexDirection: "column",
+      }}
+    >
+      {/* Header */}
+      <header
+        style={{
+          padding: "14px 16px",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 12,
+          borderBottom: "1px solid rgba(255,255,255,0.08)",
+          position: "sticky",
+          top: 0,
+          backdropFilter: "blur(8px)",
+          background: "rgba(2, 6, 23, 0.6)",
+          zIndex: 10,
+        }}
+      >
+        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+          <div style={{ fontSize: 15, fontWeight: 700 }}>
+            MVVC · {formatAssistantLabel()}
           </div>
-        </header>
+          <div style={{ fontSize: 12, opacity: 0.8 }}>
+            {threadId ? `Thread: ${threadId.slice(0, 8)}…` : "Thread: new"}
+          </div>
+        </div>
 
-        <div style={styles.chat}>
-          {messages.map((m, i) => (
-            <div
-              key={i}
-              style={{
-                ...styles.msg,
-                justifyContent: m.role === "user" ? "flex-end" : "flex-start"
-              }}
-            >
+        <button
+          onClick={clearThread}
+          style={{
+            border: "1px solid rgba(255,255,255,0.15)",
+            background: "rgba(255,255,255,0.06)",
+            color: "white",
+            padding: "8px 10px",
+            borderRadius: 10,
+            cursor: "pointer",
+            fontSize: 13,
+            whiteSpace: "nowrap",
+          }}
+          title="Start a new conversation"
+        >
+          New chat
+        </button>
+      </header>
+
+      {/* Messages */}
+      <section
+        style={{
+          flex: 1,
+          padding: "16px",
+          width: "100%",
+          maxWidth: 880,
+          margin: "0 auto",
+        }}
+      >
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {messages.map((m) => {
+            const isUser = m.role === "user";
+
+            return (
               <div
+                key={m.id}
                 style={{
-                  ...styles.bubble,
-                  ...(m.role === "user" ? styles.userBubble : {})
+                  display: "flex",
+                  justifyContent: isUser ? "flex-end" : "flex-start",
                 }}
               >
-                <div style={styles.bubbleHeader}>
-                  {m.role === "user" ? <strong>You</strong> : <AssistantLabel />}
+                <div
+                  style={{
+                    maxWidth: "92%",
+                    width: "fit-content",
+                    padding: "12px 12px",
+                    borderRadius: 14,
+                    border: "1px solid rgba(255,255,255,0.12)",
+                    background: isUser
+                      ? "rgba(255,255,255,0.12)"
+                      : "rgba(255,255,255,0.06)",
+                    whiteSpace: "pre-wrap",
+                    lineHeight: 1.35,
+                    fontSize: 14,
+                  }}
+                >
+                  {!isUser && (
+                    <div
+                      style={{
+                        fontSize: 12,
+                        opacity: 0.85,
+                        marginBottom: 6,
+                      }}
+                    >
+                      {formatAssistantLabel()}
+                    </div>
+                  )}
+                  {m.text}
                 </div>
-
-                {m.role === "user" ? (
-                  <div style={styles.textPlain}>{m.content}</div>
-                ) : (
-                  <div
-                    className="niceChat"
-                    dangerouslySetInnerHTML={{ __html: toNiceHtml(m.content) }}
-                  />
-                )}
               </div>
-            </div>
-          ))}
-
-          {loading && (
-            <div style={styles.msg}>
-              <div style={styles.bubble}>
-                <div style={styles.bubbleHeader}>
-                  <AssistantLabel />
-                </div>
-                <div style={styles.textPlain}>Analyzing…</div>
-              </div>
-            </div>
-          )}
-
+            );
+          })}
           <div ref={bottomRef} />
         </div>
-
-        <div style={styles.suggested}>
-          {SUGGESTED.map((q) => (
-            <button
-              key={q}
-              style={styles.chip}
-              onClick={() => sendQuestion(q)}
-              disabled={loading}
-            >
-              {q}
-            </button>
-          ))}
-        </div>
-
-        <div style={styles.inputBox}>
-          <textarea
-            placeholder="Ask a question… (Enter to send, Shift+Enter for a new line)"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                sendQuestion();
-              }
-            }}
-            disabled={loading}
-            style={styles.textarea}
-          />
-          <button
-            onClick={() => sendQuestion()}
-            disabled={loading || !input.trim()}
-            style={styles.sendButton}
-          >
-            Send
-          </button>
-        </div>
-
-        {error && <div style={styles.error}>{error}</div>}
       </section>
 
-      <style>{`
-        .niceChat { margin-top: 6px; line-height: 1.55; }
-        .niceHeading { font-weight: 800; margin-top: 10px; }
-        .headingUnderline { text-decoration: underline; text-underline-offset: 4px; }
-        .nicePara { margin-top: 8px; }
-        .niceList { margin: 10px 0 0 18px; padding: 0; }
-        .niceList li { margin: 7px 0; }
-      `}</style>
+      {/* Composer */}
+      <footer
+        style={{
+          padding: "14px 16px",
+          borderTop: "1px solid rgba(255,255,255,0.08)",
+          background: "rgba(2, 6, 23, 0.6)",
+          backdropFilter: "blur(8px)",
+        }}
+      >
+        <div
+          style={{
+            width: "100%",
+            maxWidth: 880,
+            margin: "0 auto",
+            display: "flex",
+            gap: 10,
+            alignItems: "flex-end",
+          }}
+        >
+          <textarea
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={onKeyDown}
+            placeholder="Ask a question… (Enter to send, Shift+Enter for new line)"
+            rows={2}
+            style={{
+              flex: 1,
+              resize: "none",
+              padding: "12px 12px",
+              borderRadius: 12,
+              border: "1px solid rgba(255,255,255,0.15)",
+              background: "rgba(255,255,255,0.05)",
+              color: "white",
+              fontSize: 14,
+              outline: "none",
+              lineHeight: 1.3,
+            }}
+          />
+
+          <button
+            onClick={sendMessage}
+            disabled={!canSend}
+            style={{
+              padding: "11px 14px",
+              borderRadius: 12,
+              border: "1px solid rgba(255,255,255,0.18)",
+              background: canSend ? "rgba(255,255,255,0.16)" : "rgba(255,255,255,0.06)",
+              color: "white",
+              cursor: canSend ? "pointer" : "not-allowed",
+              fontSize: 14,
+              fontWeight: 600,
+              minWidth: 82,
+            }}
+          >
+            {isSending ? "Sending…" : "Send"}
+          </button>
+        </div>
+      </footer>
     </main>
   );
 }
-
-const styles: Record<string, React.CSSProperties> = {
-  page: {
-    minHeight: "100vh",
-    display: "flex",
-    justifyContent: "center",
-    padding: 16
-  },
-  card: {
-    background: "#ffffff",
-    width: "100%",
-    maxWidth: 760,
-    borderRadius: 16,
-    padding: 16,
-    display: "flex",
-    flexDirection: "column"
-  },
-  header: {
-    marginBottom: 12
-  },
-  headerRow: {
-    display: "flex",
-    alignItems: "center",
-    gap: 10
-  },
-  headerLogo: {
-    borderRadius: 8
-  },
-  title: {
-    margin: 0,
-    fontSize: "1.4rem"
-  },
-  subtitle: {
-    margin: "6px 0 0",
-    color: "#475569",
-    fontSize: "0.95rem"
-  },
-  chat: {
-    flex: 1,
-    overflowY: "auto",
-    margin: "12px 0"
-  },
-  msg: {
-    display: "flex",
-    marginBottom: 12
-  },
-  bubble: {
-    background: "#f1f5f9",
-    borderRadius: 14,
-    padding: 12,
-    maxWidth: "90%",
-    fontSize: "0.96rem"
-  },
-  bubbleHeader: {
-    opacity: 0.9
-  },
-  assistantLabel: {
-    display: "inline-flex",
-    alignItems: "center",
-    gap: 8,
-    fontWeight: 700
-  },
-  assistantLogo: {
-    borderRadius: 4,
-    display: "inline-block"
-  },
-  userBubble: {
-    background: "#2563eb",
-    color: "#ffffff"
-  },
-  textPlain: {
-    marginTop: 6,
-    whiteSpace: "pre-wrap",
-    lineHeight: 1.5
-  },
-  suggested: {
-    display: "flex",
-    gap: 6,
-    flexWrap: "wrap",
-    marginBottom: 8
-  },
-  chip: {
-    fontSize: "0.78rem",
-    padding: "7px 10px",
-    borderRadius: 999,
-    border: "1px solid #cbd5f5",
-    background: "#f8fafc",
-    cursor: "pointer"
-  },
-  inputBox: {
-    display: "flex",
-    gap: 8
-  },
-  textarea: {
-    flex: 1,
-    resize: "none",
-    padding: 10,
-    borderRadius: 10,
-    border: "1px solid #cbd5f5",
-    fontSize: "0.95rem",
-    minHeight: 46
-  },
-  sendButton: {
-    padding: "10px 14px",
-    borderRadius: 10,
-    border: "none",
-    background: "#2563eb",
-    color: "#ffffff",
-    fontWeight: 700,
-    cursor: "pointer"
-  },
-  error: {
-    marginTop: 8,
-    color: "#dc2626",
-    fontSize: "0.9rem"
-  }
-};
