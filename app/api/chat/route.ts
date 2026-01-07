@@ -12,8 +12,8 @@ type MatchRow = {
   match_date: string | null;
   tournament: string | null;
   opponent: string | null;
-  result: string | null; // "Won" / "Lost" / etc.
-  score: string | null;  // "25-23, 25-13" etc
+  result: string | null;
+  score: string | null;
   round: string | null;
   sets_won: number | null;
   sets_lost: number | null;
@@ -25,7 +25,7 @@ type StatRow = {
   position: string | null;
   game_date: string | null;
   opponent: string | null;
-  stats: Record<string, any> | null; // JSONB
+  stats: Record<string, any> | null;
 };
 
 function toNum(v: any): number {
@@ -53,8 +53,6 @@ function underline(title: string) {
   return `${title}\n${"-".repeat(Math.max(8, title.length))}`;
 }
 
-// Parse score like "25-23, 15-25, 15-13" into point diff totals (team perspective unknown).
-// We can still compute "close sets" frequency without knowing which side was MVVC by using absolute deltas.
 function parseSetDeltas(score: string | null): number[] {
   const text = (score ?? "").trim();
   if (!text) return [];
@@ -75,7 +73,10 @@ function computeMatchSummaries(matches: MatchRow[]) {
   let w = 0, l = 0, u = 0;
   let setsWon = 0, setsLost = 0;
 
-  const byOpponent: Record<string, { w: number; l: number; setsWon: number; setsLost: number; closeSets: number; matches: number }> = {};
+  const byOpponent: Record<
+    string,
+    { w: number; l: number; setsWon: number; setsLost: number; closeSets: number; matches: number }
+  > = {};
   const byTournament: Record<string, { w: number; l: number; matches: number }> = {};
 
   for (const m of matches) {
@@ -96,7 +97,6 @@ function computeMatchSummaries(matches: MatchRow[]) {
     byOpponent[opp].setsLost += toNum(m.sets_lost);
 
     const deltas = parseSetDeltas(m.score);
-    // count "close sets" as <= 2 points margin
     byOpponent[opp].closeSets += deltas.filter((d) => d <= 2).length;
 
     const t = safeName(m.tournament);
@@ -106,7 +106,6 @@ function computeMatchSummaries(matches: MatchRow[]) {
     if (r === "L") byTournament[t].l += 1;
   }
 
-  // Opponents that "caused trouble" = most losses, then worst set diff, then most close sets
   const troubleOpponents = Object.entries(byOpponent)
     .map(([opponent, v]) => ({
       opponent,
@@ -133,7 +132,6 @@ function computeMatchSummaries(matches: MatchRow[]) {
 }
 
 function computePlayerTotals(statsRows: StatRow[]) {
-  // Aggregate per player
   const totals: Record<string, Record<string, number>> = {};
 
   for (const row of statsRows) {
@@ -141,31 +139,24 @@ function computePlayerTotals(statsRows: StatRow[]) {
     if (!totals[name]) totals[name] = {};
 
     const s = row.stats ?? {};
-    // common keys (adjust as your CSV headers evolve)
+
     const kills = toNum(s["attack_kills"]);
-    const atkErr = toNum(s["attack_errors"]);
-    const atkAtt = toNum(s["attack_attempts"]);
     const digs = toNum(s["digs_successful"]);
     const aces = toNum(s["serve_aces"]);
     const srvErr = toNum(s["serve_errors"]);
 
     totals[name]["attack_kills"] = (totals[name]["attack_kills"] ?? 0) + kills;
-    totals[name]["attack_errors"] = (totals[name]["attack_errors"] ?? 0) + atkErr;
-    totals[name]["attack_attempts"] = (totals[name]["attack_attempts"] ?? 0) + atkAtt;
     totals[name]["digs_successful"] = (totals[name]["digs_successful"] ?? 0) + digs;
     totals[name]["serve_aces"] = (totals[name]["serve_aces"] ?? 0) + aces;
     totals[name]["serve_errors"] = (totals[name]["serve_errors"] ?? 0) + srvErr;
 
-    // Serve-receive rating: try weighted average by attempts
     const srAtt = toNum(s["serve_receive_attempts"]);
     const srRating = toNum(s["serve_receive_passing_rating"]);
 
-    // If rating is present (0-3 scale), compute weighted sum
     if (srAtt > 0 && srRating > 0) {
       totals[name]["_sr_attempts"] = (totals[name]["_sr_attempts"] ?? 0) + srAtt;
       totals[name]["_sr_rating_sum"] = (totals[name]["_sr_rating_sum"] ?? 0) + srRating * srAtt;
     } else {
-      // fallback: if counts exist, compute rating from 0/1/2/3 counts
       const c0 = toNum(s["serve_receive_rating_0_count"]);
       const c1 = toNum(s["serve_receive_rating_1_count"]);
       const c2 = toNum(s["serve_receive_rating_2_count"]);
@@ -179,21 +170,16 @@ function computePlayerTotals(statsRows: StatRow[]) {
     }
   }
 
-  // Build output list
   const out: Array<{ player: string; totals: Record<string, number> }> = [];
-  for (const player of Object.keys(totals)) {
-    out.push({ player, totals: totals[player] });
-  }
+  for (const player of Object.keys(totals)) out.push({ player, totals: totals[player] });
 
-  // Helpers for ranking
-  function topBy(key: string, n = 5) {
+  function topBy(key: string, n = 6) {
     return [...out]
       .sort((a, b) => (b.totals[key] ?? 0) - (a.totals[key] ?? 0))
       .slice(0, n)
       .map((x) => ({ player: x.player, value: x.totals[key] ?? 0 }));
   }
 
-  // Derived: SR rating
   const srRatings = out
     .map((x) => {
       const att = x.totals["_sr_attempts"] ?? 0;
@@ -205,19 +191,18 @@ function computePlayerTotals(statsRows: StatRow[]) {
     .slice(0, 8);
 
   return {
-    playerTotals: out,
     topKills: topBy("attack_kills", 8),
     topDigs: topBy("digs_successful", 8),
     topAces: topBy("serve_aces", 8),
     topServeErrors: topBy("serve_errors", 8),
     srRatings,
+    rowsCount: statsRows.length,
   };
 }
 
 async function retrieveData(teamId: string, season: string, question: string) {
   const supabase = supabaseService();
 
-  // 1) Roster + notes
   const { data: rosterChunks, error: er } = await supabase
     .from("knowledge_chunks")
     .select("id,title,content,tags")
@@ -236,13 +221,11 @@ async function retrieveData(teamId: string, season: string, question: string) {
     .limit(6);
   if (e1) throw e1;
 
-  // Merge notes
   const merged: Record<string, any> = {};
   (rosterChunks ?? []).forEach((c: any) => (merged[String(c.id)] = c));
   (searchChunks ?? []).forEach((c: any) => (merged[String(c.id)] = c));
   const chunks = Object.values(merged);
 
-  // 2) Match results
   const { data: matches, error: em } = await supabase
     .from("match_results")
     .select("match_date,tournament,opponent,result,score,round,sets_won,sets_lost,set_diff")
@@ -251,7 +234,6 @@ async function retrieveData(teamId: string, season: string, question: string) {
     .limit(600);
   if (em) throw em;
 
-  // 3) Player stats rows
   const { data: statsRows, error: es } = await supabase
     .from("player_game_stats")
     .select("player_name,position,game_date,opponent,stats")
@@ -266,58 +248,52 @@ async function retrieveData(teamId: string, season: string, question: string) {
 function buildContext(chunks: any[], matches: MatchRow[], statsRows: StatRow[]) {
   const parts: string[] = [];
 
-  // Notes
   if (chunks.length) {
-    parts.push(underline("TEAM NOTES / ROSTER"));
-    for (const c of chunks) {
-      parts.push(`• ${c.title}\n${c.content}`);
-    }
+    parts.push(underline("TEAM NOTES / ROSTER (FACT SOURCE)"));
+    for (const c of chunks) parts.push(`• ${c.title}\n${c.content}`);
     parts.push("");
   }
 
-  // Matches summary
   if (matches.length) {
     const m = computeMatchSummaries(matches);
 
-    parts.push(underline("MATCH RESULTS SUMMARY"));
+    parts.push(underline("MATCH RESULTS (FACT SOURCE)"));
     parts.push(`Overall record: ${m.record.w}-${m.record.l}${m.record.u ? `-${m.record.u}` : ""}`);
     parts.push(`Sets: ${m.record.setsWon}-${m.record.setsLost} (diff ${m.record.setDiff})`);
     parts.push("");
 
-    parts.push(underline("OPPONENTS THAT CAUSED TROUBLE (DATA)"));
-    // "Trouble" here is purely the ranking logic we defined
+    parts.push(underline("OPPONENTS THAT CAUSED TROUBLE (FACT SOURCE)"));
     for (const t of m.troubleOpponents) {
       parts.push(`• ${t.opponent}: ${t.w}-${t.l} | sets ${t.setsWon}-${t.setsLost} | close sets (<=2 pts): ${t.closeSets}`);
     }
     parts.push("");
 
-    parts.push(underline("TOURNAMENT RECORDS (DATA)"));
+    parts.push(underline("TOURNAMENT RECORDS (FACT SOURCE)"));
     for (const t of m.tournamentSummary) {
       parts.push(`• ${t.tournament}: ${t.w}-${t.l} (matches ${t.matches})`);
     }
     parts.push("");
   } else {
-    parts.push(underline("MATCH RESULTS SUMMARY"));
+    parts.push(underline("MATCH RESULTS (FACT SOURCE)"));
     parts.push("No match_results rows found for this team.");
     parts.push("");
   }
 
-  // Player stat summary
   if (statsRows.length) {
     const p = computePlayerTotals(statsRows);
 
-    parts.push(underline("PLAYER STATS SUMMARY (AGGREGATED FROM GAME ROWS)"));
-    parts.push(`Rows loaded: ${statsRows.length}`);
+    parts.push(underline("PLAYER STATS (FACT SOURCE)"));
+    parts.push(`Rows loaded: ${p.rowsCount}`);
     parts.push("");
 
-    parts.push(underline("LEADERS"));
-    parts.push("Kills (top): " + p.topKills.map((x) => `${x.player} ${x.value}`).join(" | "));
-    parts.push("Digs (top): " + p.topDigs.map((x) => `${x.player} ${x.value}`).join(" | "));
-    parts.push("Aces (top): " + p.topAces.map((x) => `${x.player} ${x.value}`).join(" | "));
-    parts.push("Serve Errors (top): " + p.topServeErrors.map((x) => `${x.player} ${x.value}`).join(" | "));
+    parts.push(underline("LEADERS (FACT SOURCE)"));
+    parts.push("Kills: " + p.topKills.map((x) => `${x.player} ${x.value}`).join(" | "));
+    parts.push("Digs: " + p.topDigs.map((x) => `${x.player} ${x.value}`).join(" | "));
+    parts.push("Aces: " + p.topAces.map((x) => `${x.player} ${x.value}`).join(" | "));
+    parts.push("Serve Errors: " + p.topServeErrors.map((x) => `${x.player} ${x.value}`).join(" | "));
     parts.push("");
 
-    parts.push(underline("SERVE-RECEIVE RATING (0–3 SCALE, WEIGHTED)"));
+    parts.push(underline("SERVE-RECEIVE RATING (0–3 WEIGHTED) (FACT SOURCE)"));
     if (p.srRatings.length) {
       parts.push(
         p.srRatings
@@ -329,7 +305,7 @@ function buildContext(chunks: any[], matches: MatchRow[], statsRows: StatRow[]) 
     }
     parts.push("");
   } else {
-    parts.push(underline("PLAYER STATS SUMMARY"));
+    parts.push(underline("PLAYER STATS (FACT SOURCE)"));
     parts.push("No player_game_stats rows found for this team/season.");
     parts.push("");
   }
@@ -337,17 +313,10 @@ function buildContext(chunks: any[], matches: MatchRow[], statsRows: StatRow[]) 
   return parts.join("\n");
 }
 
-function emphasizePlayerNames(text: string) {
-  // Subtle emphasis: bold known roster/player tokens that appear as standalone words.
-  // This is intentionally simple.
-  const names = [
-    "Eric", "Brooks", "Cooper", "Troy", "Jayden", "Bodhi", "Anson", "Koa", "Allen", "Ryota", "Steven"
-  ];
+function emphasizeNames(text: string) {
+  const names = ["Eric","Brooks","Cooper","Troy","Jayden","Bodhi","Anson","Koa","Allen","Ryota","Steven"];
   let out = text;
-  for (const n of names) {
-    const re = new RegExp(`\\b${n}\\b`, "g");
-    out = out.replace(re, `**${n}**`);
-  }
+  for (const n of names) out = out.replace(new RegExp(`\\b${n}\\b`, "g"), `**${n}**`);
   return out;
 }
 
@@ -358,26 +327,27 @@ async function callOpenAI(question: string, context: string) {
   const system = `
 You are the MVVC volleyball Coaching Assistant.
 
-You MUST answer in two modes:
+You MUST respond using this exact structure:
 
-1) Data-Backed (FACTS)
-- Only state facts that are supported by the provided CONTEXT.
-- Use the aggregates provided (record/leaders/opponent trouble list) when relevant.
+Data-Backed (Facts)
+-------------------
+- Only include items that are directly supported by CONTEXT.
+- If the context does not support the requested facts, say so plainly.
 
-2) Coaching Insight (INFERENCE)
-- You MAY provide reasonable coaching interpretation, but label it clearly as "Coaching Insight".
-- Do NOT invent numbers in Coaching Insight.
-- If the user asks for something not present (ex: "key moments" without match notes), say what is missing in Data-Backed, then still give Coaching Insight suggestions based on what IS present (e.g., record patterns, close sets, leaders, roster notes).
+Coaching Insight (Inference)
+----------------------------
+- Provide coaching interpretation / recommendations based on the facts above.
+- Do NOT invent numbers here.
+- Do NOT claim events ("key moments") unless explicitly present in CONTEXT.
 
-Formatting rules:
-- Use clean spacing.
-- Use clear section headers with an underline line of dashes under the header.
-- Keep paragraphs short (prefer bullets).
-- Make player names stand out (bold is fine).
-- Do NOT show citations like S3/K2/etc.
+Hard rule:
+- Never mix facts and inference in the same bullet.
+- If a bullet contains a number/stat, it MUST be in Data-Backed (Facts).
 
-If you truly cannot answer even with inference, say:
-"I don’t have enough data loaded yet to answer that meaningfully."
+Style:
+- Short bullets, generous spacing.
+- Bold player names.
+- No citations like S3/K2.
 `;
 
   const res = await fetch("https://api.openai.com/v1/responses", {
@@ -390,14 +360,8 @@ If you truly cannot answer even with inference, say:
       model,
       max_output_tokens: 900,
       input: [
-        {
-          role: "system",
-          content: [{ type: "input_text", text: system }],
-        },
-        {
-          role: "user",
-          content: [{ type: "input_text", text: `Question: ${question}\n\nCONTEXT:\n${context}` }],
-        },
+        { role: "system", content: [{ type: "input_text", text: system }] },
+        { role: "user", content: [{ type: "input_text", text: `Question: ${question}\n\nCONTEXT:\n${context}` }] },
       ],
     }),
   });
@@ -409,9 +373,7 @@ If you truly cannot answer even with inference, say:
 
   const json = await res.json();
 
-  // Robust extraction: handle output_text and summary_text
   let text = "";
-
   if (typeof json.output_text === "string" && json.output_text.trim()) {
     text = json.output_text;
   } else {
@@ -428,11 +390,10 @@ If you truly cannot answer even with inference, say:
 
   text = (text || "").trim();
   if (!text) {
-    // Fallback if model returned nothing usable
-    return "I couldn’t generate an answer, but your data is loaded. Try asking a more specific question (kills, digs, passing, win/loss, or a specific opponent).";
+    return "Data-Backed (Facts)\n-------------------\n- I couldn’t generate a response even though data is loaded.\n\nCoaching Insight (Inference)\n----------------------------\n- Try asking a more specific question (kills, digs, passing, win/loss, or a specific opponent).";
   }
 
-  return emphasizePlayerNames(text);
+  return emphasizeNames(text);
 }
 
 export async function POST(req: Request) {
@@ -441,13 +402,10 @@ export async function POST(req: Request) {
     const question = String(body.question ?? "").trim();
     if (!question) return NextResponse.json({ error: "question is required" }, { status: 400 });
 
-    const teamId = TEAM_ID;
-    const season = DEFAULT_SEASON;
+    const { chunks, matches, statsRows } = await retrieveData(TEAM_ID, DEFAULT_SEASON, question);
+    const ctx = buildContext(chunks, matches, statsRows);
 
-    const { chunks, matches, statsRows } = await retrieveData(teamId, season, question);
-    const context = buildContext(chunks, matches, statsRows);
-
-    const answer = await callOpenAI(question, context);
+    const answer = await callOpenAI(question, ctx);
     return NextResponse.json({ answer });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message ?? String(e) }, { status: 500 });
