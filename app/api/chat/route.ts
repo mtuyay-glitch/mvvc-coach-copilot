@@ -1,33 +1,40 @@
 import { NextResponse } from "next/server";
 import { supabaseService } from "../../../lib/supabaseServer";
 
-function assertEnv(name: string) {
-  if (!process.env[name]) throw new Error(`Missing env var: ${name}`);
-}
-
+/**
+ * Team + season defaults for your service.
+ * You can later make these dynamic by passing from the UI.
+ */
 const TEAM_ID = "7d5c9d23-e78c-4b08-8869-64cece1acee5"; // MVVC 14 Black
-const DEFAULT_SEASON = "spring"; // change if you want
+const DEFAULT_SEASON = "spring";
 
+/**
+ * Basic Supabase row types (subset of columns we read)
+ */
 type MatchRow = {
   match_date: string | null;
-  tournament: string | null;
   opponent: string | null;
   result: string | null; // "W"/"L" or "Won"/"Lost"
-  score: string | null;
-  round: string | null;
-  sets_won: number | null;
-  sets_lost: number | null;
   set_diff: number | null;
 };
 
 type StatRow = {
   player_name: string | null;
-  position: string | null;
-  game_date: string | null;
-  opponent: string | null;
   stats: any; // jsonb from supabase (object or string)
 };
 
+/**
+ * ---------
+ * Utilities
+ * ---------
+ */
+
+/** Ensure env exists (used only when we call OpenAI) */
+function assertEnv(name: string) {
+  if (!process.env[name]) throw new Error(`Missing env var: ${name}`);
+}
+
+/** Convert unknown value to a safe number */
 function toNum(v: any): number {
   if (v === null || v === undefined) return 0;
   if (typeof v === "number") return Number.isFinite(v) ? v : 0;
@@ -37,6 +44,7 @@ function toNum(v: any): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+/** Parse stats json that might arrive as object OR as a JSON string */
 function parseStats(stats: any): Record<string, any> {
   if (!stats) return {};
   if (typeof stats === "object") return stats;
@@ -47,7 +55,8 @@ function parseStats(stats: any): Record<string, any> {
   }
 }
 
-function normalizeWinLoss(result: string | null): "W" | "L" | null {
+/** Normalize W/L strings into "W" or "L" */
+function normalizeWL(result: string | null): "W" | "L" | null {
   if (!result) return null;
   const r = result.toLowerCase();
   if (r === "w" || r.includes("won") || r.includes("win")) return "W";
@@ -55,41 +64,41 @@ function normalizeWinLoss(result: string | null): "W" | "L" | null {
   return null;
 }
 
-function fmtName(name: string) {
-  // subtle standout without weird brackets
-  return `**${name}**`;
+/** Clean spacing in names/team strings */
+function cleanText(s: string) {
+  return String(s || "").trim().replace(/\s+/g, " ");
 }
+
+/** Subtle highlight for player names (markdown bold) */
+function boldName(name: string) {
+  const n = cleanText(name);
+  return n ? `**${n}**` : "";
+}
+
+/**
+ * ------------------------
+ * Question intent detection
+ * ------------------------
+ * We use this to:
+ * - minimize Supabase reads (only fetch what we need)
+ * - skip OpenAI for narrow questions (fastest path)
+ */
 
 function isBroadQuestion(q: string) {
   const s = q.toLowerCase();
   return (
     s.includes("summarize") ||
     s.includes("season") ||
+    s.includes("key moments") ||
     s.includes("strength") ||
     s.includes("weakness") ||
     s.includes("improve") ||
     s.includes("regress") ||
-    s.includes("key moments") ||
     s.includes("plan") ||
     s.includes("lineup") ||
-    s.includes("starting six") ||
-    s.includes("rotation")
-  );
-}
-
-function wantsWinLoss(q: string) {
-  const s = q.toLowerCase();
-  return s.includes("win") || s.includes("loss") || s.includes("record");
-}
-
-function wantsToughOpponents(q: string) {
-  const s = q.toLowerCase();
-  return (
-    s.includes("tough") ||
-    s.includes("trouble") ||
-    s.includes("hardest") ||
-    s.includes("worst opponent") ||
-    s.includes("which opponents")
+    s.includes("starting") ||
+    s.includes("rotation") ||
+    s.includes("strategy")
   );
 }
 
@@ -109,21 +118,70 @@ function wantsKillsLeader(q: string) {
   return s.includes("kills") && (s.includes("lead") || s.includes("leader") || s.includes("most") || s.includes("top"));
 }
 
-async function retrieveData(teamId: string, season: string, question: string) {
-  const supabase = supabaseService();
+function wantsWinLoss(q: string) {
+  const s = q.toLowerCase();
+  return s.includes("record") || (s.includes("win") && s.includes("loss"));
+}
 
-  // Always keep this light and fast: only fetch what we need.
-  // Notes/roster can be useful for broad questions or player membership.
+function wantsToughOpponents(q: string) {
+  const s = q.toLowerCase();
+  return (
+    s.includes("tough") ||
+    s.includes("trouble") ||
+    s.includes("hardest") ||
+    s.includes("which opponents") ||
+    s.includes("worst opponent")
+  );
+}
+
+/**
+ * ------------------------
+ * Data fetching (optimized)
+ * ------------------------
+ * The #1 latency killer is fetching huge datasets.
+ * So we fetch only what we need based on the question.
+ */
+async function fetchMatches(teamId: string) {
+  const supabase = supabaseService();
+  const { data, error } = await supabase
+    .from("match_results")
+    .select("match_date,opponent,result,set_diff")
+    .eq("team_id", teamId)
+    .order("match_date", { ascending: true })
+    .limit(1200);
+  if (error) throw error;
+  return (data ?? []) as MatchRow[];
+}
+
+async function fetchStats(teamId: string, season: string) {
+  const supabase = supabaseService();
+  const { data, error } = await supabase
+    .from("player_game_stats")
+    .select("player_name,stats")
+    .eq("team_id", teamId)
+    .eq("season", season)
+    .order("game_date", { ascending: false })
+    .limit(4000);
+  if (error) throw error;
+  return (data ?? []) as StatRow[];
+}
+
+/**
+ * Notes are only needed for broad / narrative questions.
+ * We keep this optional to reduce query overhead for narrow questions.
+ */
+async function fetchNotes(teamId: string, season: string, question: string) {
+  const supabase = supabaseService();
   const cleaned = question.replace(/[^a-zA-Z0-9 ]/g, " ");
 
-  const { data: rosterChunks } = await supabase
+  const rosterReq = supabase
     .from("knowledge_chunks")
     .select("id,title,content,tags")
     .eq("team_id", teamId)
     .contains("tags", ["roster"])
     .limit(5);
 
-  const { data: searchChunks } = await supabase
+  const searchReq = supabase
     .from("knowledge_chunks")
     .select("id,title,content,tags")
     .eq("team_id", teamId)
@@ -131,140 +189,67 @@ async function retrieveData(teamId: string, season: string, question: string) {
     .textSearch("tsv", cleaned, { type: "websearch" })
     .limit(6);
 
-  // Match results (for record / opponents)
-  const { data: matches, error: em } = await supabase
-    .from("match_results")
-    .select("match_date,tournament,opponent,result,score,round,sets_won,sets_lost,set_diff")
-    .eq("team_id", teamId)
-    .order("match_date", { ascending: true })
-    .limit(600);
-  if (em) throw em;
+  // Parallelize these requests for speed
+  const [{ data: rosterChunks }, { data: searchChunks }] = await Promise.all([rosterReq, searchReq]);
 
-  // Player stats (for leaders / passer rating)
-  const { data: statsRows, error: es } = await supabase
-    .from("player_game_stats")
-    .select("player_name,position,game_date,opponent,stats")
-    .eq("team_id", teamId)
-    .eq("season", season)
-    .order("game_date", { ascending: false })
-    .limit(2000);
-  if (es) throw es;
+  // Dedupe by id (avoid repeats)
+  const byId: Record<string, any> = {};
+  (rosterChunks ?? []).forEach((c: any) => (byId[String(c.id)] = c));
+  (searchChunks ?? []).forEach((c: any) => (byId[String(c.id)] = c));
 
-  // Merge + dedupe notes
-  const merged = new Map<number, any>();
-  (rosterChunks ?? []).forEach((c: any) => merged.set(c.id, c));
-  (searchChunks ?? []).forEach((c: any) => merged.set(c.id, c));
-  const chunks = Array.from(merged.values());
+  const chunks = Object.values(byId);
 
-  return {
-    chunks,
-    matches: (matches ?? []) as MatchRow[],
-    statsRows: (statsRows ?? []) as StatRow[],
-  };
+  return chunks
+    .slice(0, 6)
+    .map((c: any) => {
+      const t = cleanText(c.title ?? "");
+      const x = cleanText(c.content ?? "");
+      if (!t && !x) return "";
+      if (t && x) return `${t}\n${x}`;
+      return t || x;
+    })
+    .filter(Boolean)
+    .join("\n\n");
 }
 
-function computeCoreFacts(matches: MatchRow[], statsRows: StatRow[]) {
-  // Win/Loss
+/**
+ * -------------------------
+ * Fast fact computations
+ * -------------------------
+ * These run in memory and are very fast compared to network calls.
+ */
+
+function computeWinLoss(matches: MatchRow[]) {
   let wins = 0;
   let losses = 0;
+  for (const m of matches) {
+    const wl = normalizeWL(m.result);
+    if (wl === "W") wins++;
+    if (wl === "L") losses++;
+  }
+  return { wins, losses };
+}
 
-  // Opponent aggregates
-  const oppLosses: Record<string, number> = {};
+/**
+ * “Toughest opponents” = opponents you lost to most often
+ * tie-breaker = lower (worse) cumulative set_diff.
+ */
+function computeToughOpponents(matches: MatchRow[], limit = 5) {
   const oppMatches: Record<string, number> = {};
+  const oppLosses: Record<string, number> = {};
   const oppSetDiff: Record<string, number> = {};
 
   for (const m of matches) {
-    const wl = normalizeWinLoss(m.result);
-    const opp = (m.opponent ?? "").trim() || "Unknown Opponent";
+    const opp = cleanText(m.opponent || "Unknown Opponent");
     oppMatches[opp] = (oppMatches[opp] ?? 0) + 1;
 
-    if (wl === "W") wins++;
-    if (wl === "L") {
-      losses++;
-      oppLosses[opp] = (oppLosses[opp] ?? 0) + 1;
-    }
+    const wl = normalizeWL(m.result);
+    if (wl === "L") oppLosses[opp] = (oppLosses[opp] ?? 0) + 1;
+
     oppSetDiff[opp] = (oppSetDiff[opp] ?? 0) + toNum(m.set_diff);
   }
 
-  // Player totals + weighted SR
-  type Tot = {
-    kills: number;
-    digs: number;
-    aces: number;
-    serveErrors: number;
-    srAttempts: number;
-    srWeightedSum: number;
-  };
-
-  const totals: Record<string, Tot> = {};
-
-  function ensure(player: string): Tot {
-    if (!totals[player]) {
-      totals[player] = { kills: 0, digs: 0, aces: 0, serveErrors: 0, srAttempts: 0, srWeightedSum: 0 };
-    }
-    return totals[player];
-  }
-
-  for (const row of statsRows) {
-    const player = (row.player_name ?? "").trim();
-    if (!player) continue;
-
-    const s = parseStats(row.stats);
-    const t = ensure(player);
-
-    t.kills += toNum(s.attack_kills);
-    t.digs += toNum(s.digs_successful);
-    t.aces += toNum(s.serve_aces);
-    t.serveErrors += toNum(s.serve_errors);
-
-    const srAtt = toNum(s.serve_receive_attempts);
-    const srRating = toNum(s.serve_receive_passing_rating); // 0–3 scale
-    if (srAtt > 0) {
-      t.srAttempts += srAtt;
-      t.srWeightedSum += srRating * srAtt;
-    }
-  }
-
-  const players = Object.keys(totals);
-
-  function leader(metric: keyof Tot) {
-    let bestPlayer = "";
-    let bestVal = -Infinity;
-    for (const p of players) {
-      const v = totals[p][metric];
-      if (v > bestVal) {
-        bestVal = v;
-        bestPlayer = p;
-      }
-    }
-    return bestPlayer ? { player: bestPlayer, value: bestVal } : null;
-  }
-
-  // Best passer rating (weighted)
-  let bestPasser = "";
-  let bestPasserRating = -Infinity;
-  let bestPasserAtt = 0;
-
-  let teamSrAtt = 0;
-  let teamSrSum = 0;
-
-  for (const p of players) {
-    const t = totals[p];
-    if (t.srAttempts > 0) {
-      const r = t.srWeightedSum / t.srAttempts;
-      if (r > bestPasserRating) {
-        bestPasserRating = r;
-        bestPasser = p;
-        bestPasserAtt = t.srAttempts;
-      }
-      teamSrAtt += t.srAttempts;
-      teamSrSum += t.srWeightedSum;
-    }
-  }
-
-  const teamSrRating = teamSrAtt > 0 ? teamSrSum / teamSrAtt : 0;
-
-  const trouble = Object.keys(oppMatches)
+  return Object.keys(oppMatches)
     .map((opp) => ({
       opponent: opp,
       losses: oppLosses[opp] ?? 0,
@@ -272,121 +257,146 @@ function computeCoreFacts(matches: MatchRow[], statsRows: StatRow[]) {
       setDiff: oppSetDiff[opp] ?? 0,
     }))
     .filter((x) => x.losses > 0)
-    .sort((a, b) => {
-      if (b.losses !== a.losses) return b.losses - a.losses;
-      return a.setDiff - b.setDiff;
-    })
-    .slice(0, 8);
-
-  return {
-    wins,
-    losses,
-    leaders: {
-      kills: leader("kills"),
-      digs: leader("digs"),
-      aces: leader("aces"),
-      serveErrors: leader("serveErrors"),
-    },
-    bestPasser: bestPasser
-      ? { player: bestPasser, rating: bestPasserRating, attempts: bestPasserAtt, teamRating: teamSrRating, teamAttempts: teamSrAtt }
-      : null,
-    trouble,
-    hasMatches: matches.length > 0,
-    hasStats: players.length > 0,
-  };
-}
-
-function buildNotesForLLM(chunks: any[]) {
-  if (!chunks?.length) return "";
-  const lines: string[] = [];
-  for (const c of chunks) {
-    const title = (c.title ?? "").toString().trim();
-    const content = (c.content ?? "").toString().trim();
-    if (!title && !content) continue;
-    lines.push(`${title}\n${content}`);
-  }
-  return lines.slice(0, 6).join("\n\n");
+    .sort((a, b) => (b.losses !== a.losses ? b.losses - a.losses : a.setDiff - b.setDiff))
+    .slice(0, limit);
 }
 
 /**
- * Build a small, question-specific facts payload.
- * This is the key change that removes “noise”.
+ * Compute:
+ * - kills leader
+ * - passer rating leader (weighted SR rating: sum(rating*attempts) / sum(attempts))
  */
-function buildFactsForQuestion(question: string, season: string, facts: ReturnType<typeof computeCoreFacts>) {
-  const q = question.trim();
+function computeLeadersAndPassing(statsRows: StatRow[]) {
+  type Tot = { kills: number; srAtt: number; srSum: number };
+  const totals: Record<string, Tot> = {};
 
-  const payload: any = {
-    season,
-    question: q,
+  function ensure(player: string) {
+    if (!totals[player]) totals[player] = { kills: 0, srAtt: 0, srSum: 0 };
+    return totals[player];
+  }
+
+  for (const row of statsRows) {
+    const player = cleanText(row.player_name ?? "");
+    if (!player) continue;
+    const s = parseStats(row.stats);
+    const t = ensure(player);
+
+    // Kills
+    t.kills += toNum(s.attack_kills);
+
+    // Serve-receive weighted rating (0–3 scale)
+    const att = toNum(s.serve_receive_attempts);
+    const rating = toNum(s.serve_receive_passing_rating);
+    if (att > 0) {
+      t.srAtt += att;
+      t.srSum += rating * att;
+    }
+  }
+
+  const players = Object.keys(totals);
+
+  // Kills leader
+  let killsLeader = null as null | { player: string; kills: number };
+  for (let i = 0; i < players.length; i++) {
+    const p = players[i];
+    const k = totals[p].kills;
+    if (!killsLeader || k > killsLeader.kills) killsLeader = { player: p, kills: k };
+  }
+
+  // Best passer (weighted)
+  let bestPasser = null as null | { player: string; rating: number; attempts: number };
+  let teamAtt = 0;
+  let teamSum = 0;
+
+  for (let i = 0; i < players.length; i++) {
+    const p = players[i];
+    const t = totals[p];
+    if (t.srAtt <= 0) continue;
+
+    const r = t.srSum / t.srAtt;
+    if (!bestPasser || r > bestPasser.rating) bestPasser = { player: p, rating: r, attempts: t.srAtt };
+
+    teamAtt += t.srAtt;
+    teamSum += t.srSum;
+  }
+
+  const teamRating = teamAtt > 0 ? teamSum / teamAtt : 0;
+
+  return {
+    hasStats: players.length > 0,
+    killsLeader: killsLeader && killsLeader.kills > 0 ? killsLeader : null,
+    bestPasser: bestPasser ? { ...bestPasser, rating: Number(bestPasser.rating.toFixed(2)) } : null,
+    teamSr: teamAtt > 0 ? Number(teamRating.toFixed(2)) : null,
   };
-
-  // Always include minimal “availability flags”
-  payload.dataAvailability = {
-    hasMatchResults: facts.hasMatches,
-    hasPlayerStats: facts.hasStats,
-  };
-
-  if (wantsPasserRating(q)) {
-    payload.serveReceive = {
-      scale: "0-3",
-      bestPasser: facts.bestPasser
-        ? { player: facts.bestPasser.player, rating: Number(facts.bestPasser.rating.toFixed(2)), attempts: facts.bestPasser.attempts }
-        : null,
-      teamWeightedRating: facts.bestPasser ? Number(facts.bestPasser.teamRating.toFixed(2)) : null,
-      teamAttempts: facts.bestPasser ? facts.bestPasser.teamAttempts : null,
-    };
-    return payload;
-  }
-
-  if (wantsKillsLeader(q)) {
-    payload.leaders = {
-      kills: facts.leaders.kills ? { player: facts.leaders.kills.player, total: facts.leaders.kills.value } : null,
-    };
-    return payload;
-  }
-
-  if (wantsWinLoss(q)) {
-    payload.winLoss = facts.hasMatches ? { wins: facts.wins, losses: facts.losses } : null;
-    return payload;
-  }
-
-  if (wantsToughOpponents(q)) {
-    payload.troubleOpponents = facts.trouble;
-    return payload;
-  }
-
-  // Broad questions get a compact “season snapshot” (still not a giant dump)
-  if (isBroadQuestion(q)) {
-    payload.snapshot = {
-      winLoss: facts.hasMatches ? { wins: facts.wins, losses: facts.losses } : null,
-      leaders: {
-        kills: facts.leaders.kills,
-        digs: facts.leaders.digs,
-        aces: facts.leaders.aces,
-        serveErrors: facts.leaders.serveErrors,
-      },
-      serveReceive: facts.bestPasser
-        ? {
-            scale: "0-3",
-            bestPasser: { player: facts.bestPasser.player, rating: Number(facts.bestPasser.rating.toFixed(2)), attempts: facts.bestPasser.attempts },
-            teamWeightedRating: Number(facts.bestPasser.teamRating.toFixed(2)),
-          }
-        : null,
-      troubleOpponents: facts.trouble.slice(0, 5),
-    };
-    return payload;
-  }
-
-  // Default: minimal info so the model answers directly without dumping stats
-  payload.minimal = {
-    winLoss: facts.hasMatches ? { wins: facts.wins, losses: facts.losses } : null,
-  };
-  return payload;
 }
 
-function safeExtractOutputText(json: any): string {
-  // Responses API can return different shapes across models.
-  // Try common safe paths.
+/**
+ * -------------------------------
+ * Super-fast answers (no OpenAI)
+ * -------------------------------
+ * This eliminates OpenAI latency for common narrow questions.
+ */
+function answerNarrow(question: string, season: string, matches: MatchRow[] | null, statsRows: StatRow[] | null) {
+  const q = question.trim();
+
+  // Best passer rating
+  if (wantsPasserRating(q)) {
+    const computed = computeLeadersAndPassing(statsRows ?? []);
+    if (!computed.bestPasser) {
+      return `Best passer rating\nInsufficient data in the current dataset.\nUpload/confirm serve_receive_attempts and serve_receive_passing_rating per player for season "${season}".`;
+    }
+    return `Best passer rating\n${boldName(computed.bestPasser.player)} has the top serve-receive rating: ${computed.bestPasser.rating} on ${computed.bestPasser.attempts} attempts (0–3 scale).`;
+  }
+
+  // Kills leader
+  if (wantsKillsLeader(q)) {
+    const computed = computeLeadersAndPassing(statsRows ?? []);
+    if (!computed.killsLeader) {
+      return `Kills leader\nInsufficient data in the current dataset.\nUpload/confirm attack_kills per player for season "${season}".`;
+    }
+    return `Kills leader\n${boldName(computed.killsLeader.player)} leads the team with ${computed.killsLeader.kills} kills.`;
+  }
+
+  // Win/Loss record
+  if (wantsWinLoss(q)) {
+    if (!matches || matches.length === 0) {
+      return `Win/loss record\nInsufficient data in the current dataset.\nUpload/confirm match_results for this team.`;
+    }
+    const { wins, losses } = computeWinLoss(matches);
+    return `Win/loss record\n${wins}-${losses}`;
+  }
+
+  // Tough opponents
+  if (wantsToughOpponents(q)) {
+    if (!matches || matches.length === 0) {
+      return `Toughest opponents\nInsufficient data in the current dataset.\nUpload/confirm match_results with opponent and result.`;
+    }
+    const trouble = computeToughOpponents(matches, 5);
+    if (trouble.length === 0) {
+      return `Toughest opponents\nNo losses found in match_results for this team (or results are not labeled W/L).`;
+    }
+
+    const lines: string[] = [];
+    lines.push("Toughest opponents (based on losses)");
+    for (let i = 0; i < trouble.length; i++) {
+      const t = trouble[i];
+      lines.push(`${i + 1}) ${cleanText(t.opponent)} losses ${t.losses}/${t.matches}`);
+    }
+    return lines.join("\n");
+  }
+
+  // Not narrow
+  return null;
+}
+
+/**
+ * --------------------------
+ * OpenAI (broad questions)
+ * --------------------------
+ * We only call OpenAI when we want narrative + coaching insight.
+ */
+
+function safeExtractText(json: any): string {
   let text = "";
 
   const out = json?.output;
@@ -401,39 +411,43 @@ function safeExtractOutputText(json: any): string {
     }
   }
 
-  // Fallback for some variants
   if (!text && typeof json?.output_text === "string") text = json.output_text;
   if (!text && typeof json?.text === "string") text = json.text;
 
   return (text || "").trim();
 }
 
-async function callOpenAI(question: string, season: string, factsPayload: any, notes: string) {
+async function callOpenAI(question: string, facts: any, notes: string) {
   assertEnv("OPENAI_API_KEY");
   const model = process.env.OPENAI_MODEL ?? "gpt-5-mini";
 
+  /**
+   * Important: keep the prompt small and structured.
+   * Smaller prompts = faster model time + less chance of “noise”.
+   */
   const system = `
-You are "Volleyball Guru" for the MVVC 14 Black boys volleyball team.
+You are "Volleyball Guru" for MVVC 14 Black.
 
-Goal: Answer the user’s question directly, with minimal noise.
+Goal
+Answer like ChatGPT: helpful, coach-friendly, and not overly long.
 
-Formatting rules:
-1) Start with a short title line (plain text).
-2) Then give the answer in 1–6 short lines max for narrow questions.
-3) Use player names with subtle emphasis: **Name**.
-4) Do not use hyphen dividers (no "-----") and do not dump unrelated stats.
-5) Only include extra facts if they are necessary to interpret the answer.
+Hard rules
+Use FACTS_JSON for all factual claims.
+If facts are missing, say: Insufficient data in the current dataset. Then say exactly what to upload/track.
+Use **bold** for player names.
+No citations. No brackets. No dashed dividers. No hyphen bullets.
 
-Accuracy rules:
-- Facts MUST come only from FACTS_JSON.
-- If FACTS_JSON does not contain what’s needed, say: "Insufficient data in the current dataset." and then ONE line: what to upload/track.
-- Coaching insight: If the question is broad, add a short “Coaching insight:” paragraph (2–5 lines). If the question is narrow, coaching insight is optional (1–2 lines max).
+Output shape
+Start with a short title.
+Then write a clear narrative:
+If the question is broad, 10–18 lines total.
+Use short paragraphs and occasional short lists with numbers or dots if needed (but no hyphen bullets).
 `;
 
-  const user = {
+  const payload = {
     question,
-    FACTS_JSON: factsPayload,
-    TEAM_NOTES_OPTIONAL: notes ? notes : null,
+    FACTS_JSON: facts,
+    TEAM_NOTES_OPTIONAL: notes || null,
   };
 
   const res = await fetch("https://api.openai.com/v1/responses", {
@@ -444,10 +458,11 @@ Accuracy rules:
     },
     body: JSON.stringify({
       model,
-      max_output_tokens: 700,
+      // Keep output modest for speed. Broad answers should still fit.
+      max_output_tokens: 650,
       input: [
         { role: "system", content: [{ type: "input_text", text: system }] },
-        { role: "user", content: [{ type: "input_text", text: JSON.stringify(user) }] },
+        { role: "user", content: [{ type: "input_text", text: JSON.stringify(payload) }] },
       ],
     }),
   });
@@ -457,105 +472,108 @@ Accuracy rules:
     throw new Error(`OpenAI error ${res.status}: ${txt}`);
   }
 
-  const json = await res.json();
-  return safeExtractOutputText(json);
+  return safeExtractText(await res.json());
 }
 
-function fallbackAnswer(question: string, season: string, facts: ReturnType<typeof computeCoreFacts>) {
-  const q = question.trim();
-  const lines: string[] = [];
+/**
+ * Build a compact facts packet for broad questions.
+ * This prevents the model from dumping unrelated stats,
+ * but still gives enough to write a real narrative.
+ */
+function buildBroadFacts(season: string, matches: MatchRow[], statsRows: StatRow[]) {
+  const { wins, losses } = computeWinLoss(matches);
+  const trouble = computeToughOpponents(matches, 6);
+  const computed = computeLeadersAndPassing(statsRows);
 
-  // Narrow Q fallbacks
-  if (wantsPasserRating(q)) {
-    lines.push("Best passer rating");
-    if (!facts.bestPasser) {
-      lines.push("Insufficient data in the current dataset.");
-      lines.push("Upload/confirm serve-receive attempts + rating per player.");
-      return lines.join("\n");
-    }
-    lines.push(`${fmtName(facts.bestPasser.player)} — ${facts.bestPasser.rating.toFixed(2)} (0–3) on ${facts.bestPasser.attempts} attempts`);
-    return lines.join("\n");
-  }
-
-  if (wantsKillsLeader(q)) {
-    lines.push("Team kills leader");
-    if (!facts.leaders.kills) {
-      lines.push("Insufficient data in the current dataset.");
-      lines.push("Upload/confirm attack_kills per player.");
-      return lines.join("\n");
-    }
-    lines.push(`${fmtName(facts.leaders.kills.player)} — ${facts.leaders.kills.value} kills`);
-    return lines.join("\n");
-  }
-
-  if (wantsWinLoss(q)) {
-    lines.push("Win/Loss record");
-    if (!facts.hasMatches) {
-      lines.push("Insufficient data in the current dataset.");
-      lines.push("Upload/confirm match_results for the season.");
-      return lines.join("\n");
-    }
-    lines.push(`${facts.wins}-${facts.losses}`);
-    return lines.join("\n");
-  }
-
-  if (wantsToughOpponents(q)) {
-    lines.push("Toughest opponents (based on losses)");
-    if (!facts.hasMatches || facts.trouble.length === 0) {
-      lines.push("Insufficient data in the current dataset.");
-      lines.push("Upload/confirm match_results with opponent + result.");
-      return lines.join("\n");
-    }
-    const top = facts.trouble.slice(0, 5);
-    for (let i = 0; i < top.length; i++) {
-      const t = top[i];
-      lines.push(`${i + 1}) ${t.opponent} (losses ${t.losses}/${t.matches})`);
-    }
-    return lines.join("\n");
-  }
-
-  // Broad / default fallback
-  lines.push("Answer");
-  if (!facts.hasMatches && !facts.hasStats) {
-    lines.push("Insufficient data in the current dataset.");
-    lines.push("Upload match_results and player_game_stats for this season.");
-    return lines.join("\n");
-  }
-
-  if (facts.hasMatches) lines.push(`Season record: ${facts.wins}-${facts.losses}`);
-  if (facts.bestPasser) lines.push(`Best passer: ${fmtName(facts.bestPasser.player)} (${facts.bestPasser.rating.toFixed(2)} on ${facts.bestPasser.attempts} attempts)`);
-
-  const k = facts.leaders.kills;
-  if (k) lines.push(`Kills leader: ${fmtName(k.player)} (${k.value})`);
-
-  lines.push("Coaching insight: Ask one angle (serve-receive, serving risk, sideout, defense) and I’ll give a tight plan.");
-  return lines.join("\n");
+  return {
+    season,
+    record: matches.length ? { wins, losses } : null,
+    bestPasser: computed.bestPasser
+      ? { player: computed.bestPasser.player, rating: computed.bestPasser.rating, attempts: computed.bestPasser.attempts, scale: "0-3" }
+      : null,
+    teamServeReceive: computed.teamSr !== null ? { teamWeightedRating: computed.teamSr, scale: "0-3" } : null,
+    killsLeader: computed.killsLeader ? { player: computed.killsLeader.player, kills: computed.killsLeader.kills } : null,
+    toughestOpponents: trouble,
+    availability: { hasMatches: matches.length > 0, hasStats: computed.hasStats },
+  };
 }
 
+/**
+ * --------------------------
+ * Main route handler (POST)
+ * --------------------------
+ */
 export async function POST(req: Request) {
   try {
     const body = (await req.json()) as { question: string };
-    const question = String(body.question ?? "").trim();
+    const question = cleanText(body.question ?? "");
     if (!question) return NextResponse.json({ error: "question is required" }, { status: 400 });
 
     const teamId = TEAM_ID;
     const season = DEFAULT_SEASON;
 
-    const { chunks, matches, statsRows } = await retrieveData(teamId, season, question);
-    const facts = computeCoreFacts(matches, statsRows);
+    /**
+     * Decide whether to treat it as "narrow".
+     * If narrow, we can skip OpenAI entirely (fastest possible).
+     */
+    const narrowIntent =
+      wantsPasserRating(question) || wantsKillsLeader(question) || wantsWinLoss(question) || wantsToughOpponents(question);
 
-    const factsPayload = buildFactsForQuestion(question, season, facts);
-    const notes = isBroadQuestion(question) ? buildNotesForLLM(chunks) : ""; // only include notes when broad
+    if (narrowIntent) {
+      /**
+       * For narrow questions, fetch only the table we need.
+       * This saves network time and reduces Supabase latency.
+       */
+      if (wantsWinLoss(question) || wantsToughOpponents(question)) {
+        const matches = await fetchMatches(teamId);
+        const ans = answerNarrow(question, season, matches, null);
+        return NextResponse.json({ answer: ans ?? "Insufficient data in the current dataset." });
+      } else {
+        const stats = await fetchStats(teamId, season);
+        const ans = answerNarrow(question, season, null, stats);
+        return NextResponse.json({ answer: ans ?? "Insufficient data in the current dataset." });
+      }
+    }
 
+    /**
+     * Broad questions:
+     * We need both matches + stats (for meaningful narrative),
+     * and optionally notes (roster/injuries/constraints) to improve the coaching insight.
+     *
+     * Use Promise.all to run in parallel (faster).
+     */
+    const [matches, statsRows, notes] = await Promise.all([
+      fetchMatches(teamId),
+      fetchStats(teamId, season),
+      fetchNotes(teamId, season, question),
+    ]);
+
+    const facts = buildBroadFacts(season, matches, statsRows);
+
+    // Call OpenAI only here
     let answer = "";
     try {
-      answer = await callOpenAI(question, season, factsPayload, notes);
+      answer = await callOpenAI(question, facts, notes);
     } catch {
       answer = "";
     }
 
+    /**
+     * Safety fallback: never return “No answer generated”
+     */
     if (!answer) {
-      answer = fallbackAnswer(question, season, facts);
+      const lines: string[] = [];
+      lines.push("Answer");
+      if (!facts.availability.hasMatches && !facts.availability.hasStats) {
+        lines.push("Insufficient data in the current dataset.");
+        lines.push("Upload match_results and player_game_stats for this season.");
+      } else {
+        if (facts.record) lines.push(`Season record: ${facts.record.wins}-${facts.record.losses}`);
+        if (facts.bestPasser) lines.push(`Best passer: ${boldName(facts.bestPasser.player)} (${facts.bestPasser.rating} on ${facts.bestPasser.attempts} attempts)`);
+        if (facts.killsLeader) lines.push(`Kills leader: ${boldName(facts.killsLeader.player)} (${facts.killsLeader.kills})`);
+        lines.push("Ask: strengths/weaknesses, best lineup, or toughest opponents, and I’ll give a tighter plan.");
+      }
+      answer = lines.join("\n");
     }
 
     return NextResponse.json({ answer });
