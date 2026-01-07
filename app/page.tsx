@@ -8,12 +8,9 @@ type Msg = {
 };
 
 const SUGGESTED = [
-  "Summarize the key moments of the season.",
-  "Who has the best passer rating?",
-  "Who leads the team in kills?",
-  "Analyze the strengths & weakness of the team.",
-  "Which opponents caused us the most trouble?",
-  "Best projected spring lineup based on season data?",
+  "Show me the statistical leaders across key categories.",
+  "Using a 6-2 offense, give me a projected lineup.",
+  "Recap our season so far."
 ];
 
 function escapeHtml(s: string) {
