@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
 
 type Role = "user" | "assistant";
 
@@ -15,12 +16,10 @@ function uid() {
 }
 
 function formatAssistantLabel() {
-  // If you want to rename the assistant label in the UI, change this.
   return "Volleyball Guru";
 }
 
 export default function Page() {
-  // Chat transcript shown on screen
   const [messages, setMessages] = useState<Message[]>([
     {
       id: uid(),
@@ -31,65 +30,52 @@ export default function Page() {
     },
   ]);
 
-  // The current input box value
   const [input, setInput] = useState("");
-
-  // Loading flag for UI + disabling button
   const [isSending, setIsSending] = useState(false);
 
   // Thread id = “conversation memory key”
   const [threadId, setThreadId] = useState<string | null>(null);
 
-  // For auto-scroll to bottom when new messages arrive
   const bottomRef = useRef<HTMLDivElement | null>(null);
-
-  // LocalStorage key (you can rename if you want)
   const THREAD_STORAGE_KEY = "mvvc_thread_id";
 
-  // On first load, restore thread_id (so conversation continues after refresh)
+  // Restore thread_id so chat persists across refreshes
   useEffect(() => {
     try {
       const saved = localStorage.getItem(THREAD_STORAGE_KEY);
       if (saved) setThreadId(saved);
     } catch {
-      // ignore (private mode / blocked storage)
+      // ignore
     }
   }, []);
 
-  // Auto-scroll when messages change
+  // Auto-scroll to latest message
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages.length]);
 
-  const canSend = useMemo(() => {
-    return input.trim().length > 0 && !isSending;
-  }, [input, isSending]);
+  const canSend = useMemo(() => input.trim().length > 0 && !isSending, [input, isSending]);
 
   async function sendMessage() {
-    const question = input.trim();
-    if (!question || isSending) return;
+    const message = input.trim();
+    if (!message || isSending) return;
 
-    // 1) Optimistically add the user's message to the UI immediately
-    const userMsg: Message = { id: uid(), role: "user", text: question };
+    const userMsg: Message = { id: uid(), role: "user", text: message };
     setMessages((prev) => [...prev, userMsg]);
     setInput("");
     setIsSending(true);
 
-    // 2) Add a temporary "thinking..." assistant message
     const thinkingId = uid();
-    setMessages((prev) => [
-      ...prev,
-      { id: thinkingId, role: "assistant", text: "Thinking…" },
-    ]);
+    setMessages((prev) => [...prev, { id: thinkingId, role: "assistant", text: "Thinking…" }]);
 
     try {
-      // 3) Call your backend
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        // IMPORTANT: new contract uses "message" (not "question")
         body: JSON.stringify({
-          question,
-          thread_id: threadId, // key change: send thread_id if we have it
+          message,
+          thread_id: threadId,
         }),
       });
 
@@ -97,14 +83,11 @@ export default function Page() {
 
       if (!res.ok) {
         const errText =
-          typeof data?.error === "string"
-            ? data.error
-            : `Request failed (${res.status})`;
+          typeof data?.error === "string" ? data.error : `Request failed (${res.status})`;
         throw new Error(errText);
       }
 
-      // 4) If backend returned a thread_id, store it for next requests
-      // (First message usually creates it)
+      // Persist thread_id for follow-up context
       if (data?.thread_id && typeof data.thread_id === "string") {
         const newThreadId = data.thread_id;
         if (newThreadId !== threadId) {
@@ -117,20 +100,15 @@ export default function Page() {
         }
       }
 
-      // 5) Replace "Thinking..." with the real assistant answer
       const answer =
         typeof data?.answer === "string" && data.answer.trim()
           ? data.answer.trim()
           : "No answer generated.";
 
-      setMessages((prev) =>
-        prev.map((m) => (m.id === thinkingId ? { ...m, text: answer } : m))
-      );
+      setMessages((prev) => prev.map((m) => (m.id === thinkingId ? { ...m, text: answer } : m)));
     } catch (e: any) {
       const msg =
-        typeof e?.message === "string"
-          ? e.message
-          : "Something went wrong calling /api/chat.";
+        typeof e?.message === "string" ? e.message : "Something went wrong calling /api/chat.";
 
       setMessages((prev) =>
         prev.map((m) =>
@@ -151,7 +129,6 @@ export default function Page() {
   }
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
-    // Enter to send, Shift+Enter to add a new line
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       sendMessage();
@@ -159,7 +136,6 @@ export default function Page() {
   }
 
   function clearThread() {
-    // This resets the conversation in the UI + removes thread_id
     setMessages([
       {
         id: uid(),
@@ -178,13 +154,7 @@ export default function Page() {
   }
 
   return (
-    <main
-      style={{
-        minHeight: "100vh",
-        display: "flex",
-        flexDirection: "column",
-      }}
-    >
+    <main style={{ minHeight: "100vh", display: "flex", flexDirection: "column" }}>
       {/* Header */}
       <header
         style={{
@@ -266,17 +236,13 @@ export default function Page() {
                   }}
                 >
                   {!isUser && (
-                    <div
-                      style={{
-                        fontSize: 12,
-                        opacity: 0.85,
-                        marginBottom: 6,
-                      }}
-                    >
+                    <div style={{ fontSize: 12, opacity: 0.85, marginBottom: 6 }}>
                       {formatAssistantLabel()}
                     </div>
                   )}
-                  {m.text}
+
+                  {/* Render Markdown so **player names** actually bold */}
+                  <ReactMarkdown>{m.text}</ReactMarkdown>
                 </div>
               </div>
             );
