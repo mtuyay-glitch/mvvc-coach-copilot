@@ -41,7 +41,6 @@ function computeTotals(statsRows: StatRow[]) {
     "blocks_solo",
     "blocks_assist",
     "serve_receive_attempts",
-    // rating is an average metric; we’ll compute weighted avg by attempts if available
     "serve_receive_passing_rating",
   ];
 
@@ -57,22 +56,21 @@ function computeTotals(statsRows: StatRow[]) {
       t[k] = (t[k] ?? 0) + toNum(s[k]);
     }
 
-    // Keep attempts handy for weighting rating
-    t["_sr_attempts"] = (t["_sr_attempts"] ?? 0) + toNum(s["serve_receive_attempts"]);
-    t["_sr_rating_sum"] =
-      (t["_sr_rating_sum"] ?? 0) + toNum(s["serve_receive_passing_rating"]) * toNum(s["serve_receive_attempts"]);
+    // For weighted SR rating
+    const srAtt = toNum(s["serve_receive_attempts"]);
+    const srRating = toNum(s["serve_receive_passing_rating"]);
+    t["_sr_attempts"] = (t["_sr_attempts"] ?? 0) + srAtt;
+    t["_sr_rating_sum"] = (t["_sr_rating_sum"] ?? 0) + srRating * srAtt;
   }
 
-  // compute weighted SR rating if possible
   const out: Array<{ player: string; totals: Record<string, number> }> = [];
-  for (const [player, t] of totals.entries()) {
+
+  // ✅ FIX: convert iterator to array for older TS targets
+  for (const [player, t] of Array.from(totals.entries())) {
     const srAtt = t["_sr_attempts"] ?? 0;
     const srSum = t["_sr_rating_sum"] ?? 0;
     const srRating = srAtt > 0 ? srSum / srAtt : toNum(t["serve_receive_passing_rating"]);
-
-    // store final rating as sr_rating
     t["serve_receive_passing_rating_weighted"] = srRating;
-
     out.push({ player, totals: t });
   }
 
@@ -84,7 +82,7 @@ function topN(
   key: string,
   n = 5
 ) {
-  return [...computed]
+  return computed
     .map((x) => ({ player: x.player, value: x.totals[key] ?? 0 }))
     .sort((a, b) => b.value - a.value)
     .slice(0, n);
@@ -111,16 +109,14 @@ async function retrieveContext(teamId: string, season: string, question: string)
     .eq("season", season)
     .textSearch("tsv", cleaned, { type: "websearch" })
     .limit(6);
-  // if search fails because no tsv matches, don’t hard fail
-  if (e1) {
-    // still proceed; notes are optional
-    // console.log("notes search error", e1.message);
-  }
+
+  // Don’t hard fail if search has no matches / errors
+  const safeSearchChunks = e1 ? [] : searchChunks ?? [];
 
   // Merge + dedupe
   const mergedMap = new Map<number, any>();
   (rosterChunks ?? []).forEach((c: any) => mergedMap.set(c.id, c));
-  (searchChunks ?? []).forEach((c: any) => mergedMap.set(c.id, c));
+  (safeSearchChunks ?? []).forEach((c: any) => mergedMap.set(c.id, c));
   const chunks = Array.from(mergedMap.values());
 
   // C) Match results
@@ -129,16 +125,16 @@ async function retrieveContext(teamId: string, season: string, question: string)
     .select("match_date,tournament,opponent,result,score,round,sets_won,sets_lost,set_diff")
     .eq("team_id", teamId)
     .order("match_date", { ascending: true })
-    .limit(250);
+    .limit(500);
   if (em) throw em;
 
-  // D) Player stats (try season filter, then fallback to no-season if it returns 0)
+  // D) Player stats (try season filter, fallback to no-season if 0 rows)
   let { data: statsRows, error: es } = await supabase
     .from("player_game_stats")
     .select("player_name,position,game_date,opponent,stats")
     .eq("team_id", teamId)
     .eq("season", season)
-    .limit(2000);
+    .limit(5000);
 
   if (es) throw es;
 
@@ -147,7 +143,7 @@ async function retrieveContext(teamId: string, season: string, question: string)
       .from("player_game_stats")
       .select("player_name,position,game_date,opponent,stats")
       .eq("team_id", teamId)
-      .limit(2000);
+      .limit(5000);
 
     if (fallback.error) throw fallback.error;
     statsRows = fallback.data ?? [];
@@ -177,7 +173,6 @@ function prettyContext(chunks: any[], matches: any[], statsRows: StatRow[]) {
       parts.push(`- ${d} | ${t} | ${r} vs ${opp}${sc}`);
     }
 
-    // quick computed W/L
     const wins = matches.filter((m) => String(m.result || "").toLowerCase().startsWith("w")).length;
     const losses = matches.filter((m) => String(m.result || "").toLowerCase().startsWith("l")).length;
     parts.push(`\nOverall record (from match_results): ${wins}-${losses}`);
@@ -188,10 +183,10 @@ function prettyContext(chunks: any[], matches: any[], statsRows: StatRow[]) {
 
     parts.push("\nSEASON TOTALS (computed from player_game_stats)\n----------------------------------------------");
 
-    const killsTop = topN(computed, "attack_kills", 5);
-    const digsTop = topN(computed, "digs_successful", 5);
-    const acesTop = topN(computed, "serve_aces", 5);
-    const seTop = topN(computed, "serve_errors", 5);
+    const killsTop = topN(computed, "attack_kills", 8);
+    const digsTop = topN(computed, "digs_successful", 8);
+    const acesTop = topN(computed, "serve_aces", 8);
+    const seTop = topN(computed, "serve_errors", 8);
 
     parts.push("Top kills (attack_kills):");
     killsTop.forEach((x, i) => parts.push(`- ${i + 1}. ${x.player}: ${x.value}`));
@@ -205,8 +200,7 @@ function prettyContext(chunks: any[], matches: any[], statsRows: StatRow[]) {
     parts.push("\nMost serve errors (serve_errors):");
     seTop.forEach((x, i) => parts.push(`- ${i + 1}. ${x.player}: ${x.value}`));
 
-    // Serve receive rating (weighted)
-    const sr = [...computed]
+    const sr = computed
       .map((x) => ({
         player: x.player,
         rating: x.totals["serve_receive_passing_rating_weighted"] ?? 0,
@@ -214,11 +208,13 @@ function prettyContext(chunks: any[], matches: any[], statsRows: StatRow[]) {
       }))
       .filter((x) => x.attempts > 0)
       .sort((a, b) => b.rating - a.rating)
-      .slice(0, 5);
+      .slice(0, 8);
 
     if (sr.length) {
       parts.push("\nTop serve-receive passing rating (weighted by attempts):");
-      sr.forEach((x, i) => parts.push(`- ${i + 1}. ${x.player}: ${x.rating.toFixed(2)} (attempts: ${x.attempts})`));
+      sr.forEach((x, i) =>
+        parts.push(`- ${i + 1}. ${x.player}: ${x.rating.toFixed(2)} (attempts: ${x.attempts})`)
+      );
     }
   }
 
