@@ -3,14 +3,11 @@ import { supabaseService } from "../../../lib/supabaseServer";
 
 /**
  * MVVC Coach Copilot - Chat API (2025–26)
- *
- * Design goals:
+ * Goal:
  * - Answer like ChatGPT: directly answer the question asked.
- * - Broad questions => narrative coaching response.
- * - Narrow questions => short answer, minimal noise.
- * - Facts MUST come from Supabase-derived FACTS_JSON only.
- * - Avoid "Try these prompts..." unless user asked for prompts.
- * - Highlight ALL player names consistently (no perceived favoritism).
+ * - Broad questions => narrative.
+ * - Narrow questions => short, minimal noise.
+ * - Facts MUST come only from Supabase-derived FACTS_JSON.
  */
 
 function assertEnv(name: string) {
@@ -18,18 +15,15 @@ function assertEnv(name: string) {
 }
 
 const TEAM_ID = "7d5c9d23-e78c-4b08-8869-64cece1acee5"; // MVVC 14 Black
-
-// Treat “season” as 2025–26 year window (Aug 1, 2025 → Aug 1, 2026 exclusive)
 const SEASON_START = "2025-08-01";
 const SEASON_END_EXCLUSIVE = "2026-08-01";
-
 const PERSONA = "Volleyball Guru";
 
 type MatchRow = {
   match_date: string | null;
   tournament: string | null;
   opponent: string | null;
-  result: string | null; // "W"/"L" or "Won"/"Lost"
+  result: string | null;
   score: string | null;
   round: string | null;
   sets_won: number | null;
@@ -42,7 +36,7 @@ type StatRow = {
   position: string | null;
   game_date: string | null;
   opponent: string | null;
-  stats: any; // jsonb (object or stringified JSON)
+  stats: any;
 };
 
 function toNum(v: any): number {
@@ -73,12 +67,10 @@ function normalizeWinLoss(result: string | null): "W" | "L" | null {
 }
 
 function monthKey(isoDate: string) {
-  // "2025-11-09" -> "2025-11"
   return isoDate.slice(0, 7);
 }
 
 function fmtName(name: string) {
-  // Consistent subtle emphasis
   return `**${name}**`;
 }
 
@@ -86,10 +78,6 @@ function escapeRegExp(s: string) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/**
- * Highlight ALL known player names in the final answer.
- * This prevents “only Koa is bolded” perceptions.
- */
 function highlightAllPlayerNames(answer: string, playerNames: string[]) {
   if (!answer) return answer;
   const names = Array.from(new Set((playerNames || []).map((n) => (n || "").trim()).filter(Boolean))).sort(
@@ -104,7 +92,7 @@ function highlightAllPlayerNames(answer: string, playerNames: string[]) {
   return out;
 }
 
-/** ---------------------- Intent detection (routing) ---------------------- **/
+/** ---------------------- Intent detection ---------------------- **/
 
 function s(q: string) {
   return (q || "").toLowerCase().trim();
@@ -131,7 +119,6 @@ function isLineupQuestion(q: string) {
 
 function isDefinitionQuestion(q: string) {
   const t = s(q);
-  // These must behave like ChatGPT definitions, not season recaps.
   return (
     t.startsWith("what is ") ||
     t.startsWith("what’s ") ||
@@ -165,8 +152,6 @@ function isLeadersQuestion(q: string) {
 
 function isBroadQuestion(q: string) {
   const t = s(q);
-
-  // Broad coaching intents (narrative)
   const broadSignals = [
     "recap",
     "summarize",
@@ -186,29 +171,17 @@ function isBroadQuestion(q: string) {
     "optimal position",
     "switch position",
     "move to",
-    "lineup",
-    "starting",
-    "rotation",
-    "6-2",
-    "6 2",
     "gaps",
     "add players",
     "recruit",
     "what type of players",
     "who should we add",
   ];
-
-  return broadSignals.some((k) => t.includes(k)) || isMonthByMonthQuestion(q) || isLeadersQuestion(q);
+  return broadSignals.some((k) => t.includes(k)) || isLineupQuestion(q) || isMonthByMonthQuestion(q) || isLeadersQuestion(q);
 }
 
-/**
- * Try to extract a stat key from a question for month-by-month.
- * Example: "Month-by-month team kills" -> "attack_kills"
- */
 function inferStatKeyFromQuestion(q: string): string {
   const t = s(q);
-
-  // Map friendly words to your stats JSON keys
   const map: Array<{ includes: string[]; key: string }> = [
     { includes: ["kill", "kills"], key: "attack_kills" },
     { includes: ["dig", "digs"], key: "digs_successful" },
@@ -219,25 +192,16 @@ function inferStatKeyFromQuestion(q: string): string {
     { includes: ["block", "blocks", "solo block", "solo blocks"], key: "blocks_solo" },
     { includes: ["block assist", "block assists"], key: "blocks_assist" },
     { includes: ["attack error", "attack errors"], key: "attack_errors" },
-    { includes: ["attempt", "attempts", "attack attempts"], key: "attack_attempts" },
+    { includes: ["attack attempts", "attempts"], key: "attack_attempts" },
   ];
-
   for (const m of map) {
     if (m.includes.some((w) => t.includes(w))) return m.key;
   }
-
-  // Default for month-by-month if nothing obvious is mentioned:
-  // Serve receive rating is computed separately.
   return "";
 }
 
-/** ---------------------- Data fetching (fast) ---------------------- **/
+/** ---------------------- Fetching (parallel) ---------------------- **/
 
-/**
- * Fetch only what we need, as fast as possible.
- * - Notes/roster chunks only fetched for broad questions.
- * - DB queries run in parallel to reduce latency.
- */
 async function retrieveData(teamId: string, question: string) {
   const supabase = supabaseService();
   const broad = isBroadQuestion(question) || isRosterQuestion(question);
@@ -280,19 +244,13 @@ async function retrieveData(teamId: string, question: string) {
     .order("game_date", { ascending: false })
     .limit(8000);
 
-  const [rosterRes, notesRes, matchesRes, statsRes] = await Promise.all([
-    rosterPromise,
-    notesPromise,
-    matchesPromise,
-    statsPromise,
-  ]);
+  const [rosterRes, notesRes, matchesRes, statsRes] = await Promise.all([rosterPromise, notesPromise, matchesPromise, statsPromise]);
 
   if (rosterRes.error) throw rosterRes.error;
   if (notesRes.error) throw notesRes.error;
   if (matchesRes.error) throw matchesRes.error;
   if (statsRes.error) throw statsRes.error;
 
-  // Merge + dedupe chunks
   const merged = new Map<number, any>();
   (rosterRes.data ?? []).forEach((c: any) => merged.set(c.id, c));
   (notesRes.data ?? []).forEach((c: any) => merged.set(c.id, c));
@@ -305,16 +263,9 @@ async function retrieveData(teamId: string, question: string) {
   };
 }
 
-/** ---------------------- Aggregations (all stats + MoM) ---------------------- **/
+/** ---------------------- Aggregations ---------------------- **/
 
-/**
- * Core aggregation engine:
- * - sums EVERY numeric-ish stat field per player (kills, digs, setting_errors, blocks, etc.)
- * - supports weighted SR rating if serve_receive_attempts + serve_receive_passing_rating exist
- * - month-by-month totals for ANY stat key + month-by-month SR + top passers each month
- */
 function computeAggregates(matches: MatchRow[], statsRows: StatRow[]) {
-  // W/L + opponent trouble
   let wins = 0;
   let losses = 0;
 
@@ -336,7 +287,6 @@ function computeAggregates(matches: MatchRow[], statsRows: StatRow[]) {
     }
   }
 
-  // Per-player totals across all keys
   type PlayerAgg = {
     position: string | null;
     totals: Record<string, number>;
@@ -345,14 +295,8 @@ function computeAggregates(matches: MatchRow[], statsRows: StatRow[]) {
   };
 
   const byPlayer: Record<string, PlayerAgg> = {};
-
-  // Month-by-month team totals for ANY key
   const teamByMonth: Record<string, Record<string, number>> = {};
-
-  // Month-by-month SR team totals
   const srByMonth: Record<string, { attempts: number; weightedSum: number }> = {};
-
-  // Month-by-month per player SR (for “Top 5 passers each month”)
   const passerByMonth: Record<string, Record<string, { attempts: number; weightedSum: number }>> = {};
 
   for (const row of statsRows) {
@@ -362,22 +306,14 @@ function computeAggregates(matches: MatchRow[], statsRows: StatRow[]) {
     const stats = parseStats(row.stats);
     const pos = (row.position ?? stats.position ?? null) as string | null;
 
-    // Use game_date (ISO) for MoM
     const iso = (row.game_date ?? "").toString().trim();
     const mk = iso && iso.includes("-") ? monthKey(iso) : "";
 
-    if (!byPlayer[player]) {
-      byPlayer[player] = { position: pos, totals: {}, srAttempts: 0, srWeightedSum: 0 };
-    }
+    if (!byPlayer[player]) byPlayer[player] = { position: pos, totals: {}, srAttempts: 0, srWeightedSum: 0 };
     if (!byPlayer[player].position && pos) byPlayer[player].position = pos;
 
-    // Sum every numeric-like field in stats
     for (const key of Object.keys(stats)) {
-      // Skip obvious non-stat fields
-      if (key === "player_name" || key === "position" || key === "opponent" || key === "match_date" || key === "source_file") {
-        continue;
-      }
-
+      if (key === "player_name" || key === "position" || key === "opponent" || key === "match_date" || key === "source_file") continue;
       const n = toNum(stats[key]);
       if (n === 0) continue;
 
@@ -389,7 +325,6 @@ function computeAggregates(matches: MatchRow[], statsRows: StatRow[]) {
       }
     }
 
-    // Serve receive weighted rating support (0–3)
     const srAtt = toNum(stats.serve_receive_attempts);
     const srRating = toNum(stats.serve_receive_passing_rating);
     if (srAtt > 0) {
@@ -409,7 +344,6 @@ function computeAggregates(matches: MatchRow[], statsRows: StatRow[]) {
     }
   }
 
-  // Team SR overall
   let teamSrAttempts = 0;
   let teamSrWeightedSum = 0;
   for (const p of Object.keys(byPlayer)) {
@@ -418,19 +352,10 @@ function computeAggregates(matches: MatchRow[], statsRows: StatRow[]) {
   }
   const teamSrRating = teamSrAttempts > 0 ? teamSrWeightedSum / teamSrAttempts : 0;
 
-  // Trouble opponents (losses desc, then setDiff asc)
   const troubleOpponents = Object.keys(oppMatches)
-    .map((opp) => ({
-      opponent: opp,
-      losses: oppLosses[opp] ?? 0,
-      matches: oppMatches[opp] ?? 0,
-      setDiff: oppSetDiff[opp] ?? 0,
-    }))
+    .map((opp) => ({ opponent: opp, losses: oppLosses[opp] ?? 0, matches: oppMatches[opp] ?? 0, setDiff: oppSetDiff[opp] ?? 0 }))
     .filter((x) => x.losses > 0)
-    .sort((a, b) => {
-      if (b.losses !== a.losses) return b.losses - a.losses;
-      return a.setDiff - b.setDiff;
-    })
+    .sort((a, b) => (b.losses !== a.losses ? b.losses - a.losses : a.setDiff - b.setDiff))
     .slice(0, 10);
 
   return {
@@ -447,7 +372,7 @@ function computeAggregates(matches: MatchRow[], statsRows: StatRow[]) {
   };
 }
 
-/** ---------------------- Helpers: leaderboards & passers ---------------------- **/
+/** ---------------------- Leaderboards ---------------------- **/
 
 function topNForKey(byPlayer: Record<string, { totals: Record<string, number> }>, key: string, n: number) {
   return Object.keys(byPlayer)
@@ -470,10 +395,7 @@ function topNPassersOverall(byPlayer: Record<string, { srAttempts: number; srWei
     .slice(0, n);
 }
 
-function topNPassersEachMonth(
-  passerByMonth: Record<string, Record<string, { attempts: number; weightedSum: number }>>,
-  n: number
-) {
+function topNPassersEachMonth(passerByMonth: Record<string, Record<string, { attempts: number; weightedSum: number }>>, n: number) {
   const out: Array<{ month: string; rows: Array<{ player: string; rating: number; attempts: number }> }> = [];
   const months = Object.keys(passerByMonth).sort();
 
@@ -495,7 +417,7 @@ function topNPassersEachMonth(
   return out;
 }
 
-/** ---------------------- Notes for broad questions ---------------------- **/
+/** ---------------------- Notes ---------------------- **/
 
 function buildNotes(chunks: any[]) {
   if (!chunks?.length) return "";
@@ -505,7 +427,6 @@ function buildNotes(chunks: any[]) {
     const title = String(c.title ?? "").trim();
     const content = String(c.content ?? "").trim();
     if (!title && !content) continue;
-
     if (title) parts.push(title);
     if (content) parts.push(content);
     parts.push("");
@@ -522,75 +443,53 @@ function buildFactsPayload(question: string, agg: ReturnType<typeof computeAggre
   const base = {
     window: { start: SEASON_START, endExclusive: SEASON_END_EXCLUSIVE },
     winLoss: agg.hasMatches ? { wins: agg.wins, losses: agg.losses } : null,
-    teamServeReceive:
-      agg.teamSr.attempts > 0
-        ? { scale: "0-3", rating: Number(agg.teamSr.rating.toFixed(2)), attempts: agg.teamSr.attempts }
-        : null,
+    teamServeReceive: agg.teamSr.attempts > 0 ? { scale: "0-3", rating: Number(agg.teamSr.rating.toFixed(2)), attempts: agg.teamSr.attempts } : null,
     troubleOpponents: agg.troubleOpponents.slice(0, 6),
   };
 
-  // Definitions should behave like ChatGPT: no stats required.
-  if (isDefinitionQuestion(question)) {
-    return { type: "definition", ...base };
-  }
+  if (isDefinitionQuestion(question)) return { type: "definition", ...base };
 
-  // Roster/positions: use notes primarily
-  if (isRosterQuestion(question)) {
-    return { type: "roster", ...base, notes };
-  }
+  if (isRosterQuestion(question)) return { type: "roster", ...base, notes };
 
-  // Lineup questions: send only what’s helpful for lineup decisions
+  // LINEUP: include the best available lineup-relevant stats so the model can answer with a lineup.
   if (isLineupQuestion(question)) {
-    const killsTop = topNForKey(agg.byPlayer as any, "attack_kills", 8);
-    const assistsTop = topNForKey(agg.byPlayer as any, "setting_assists", 8);
-    const blocksSoloTop = topNForKey(agg.byPlayer as any, "blocks_solo", 8);
-    const blocksAssistTop = topNForKey(agg.byPlayer as any, "blocks_assist", 8);
-    const bestPassersTop = topNPassersOverall(agg.byPlayer, 8).map((r) => ({
-      player: r.player,
-      rating: Number(r.rating.toFixed(2)),
-      attempts: r.attempts,
-    }));
-
-    return {
-      type: "lineup",
-      ...base,
-      candidates: {
-        killsTop,
-        assistsTop,
-        blocksSoloTop,
-        blocksAssistTop,
-        bestPassersTop,
-      },
-      // Provide any roster notes that might mention positions
-      notes,
+    const candidates = {
+      settersByAssists: topNForKey(agg.byPlayer as any, "setting_assists", 6),
+      hittersByKills: topNForKey(agg.byPlayer as any, "attack_kills", 10),
+      passersBySR: topNPassersOverall(agg.byPlayer, 8).map((r) => ({
+        player: r.player,
+        rating: Number(r.rating.toFixed(2)),
+        attempts: r.attempts,
+      })),
+      blockersBySolo: topNForKey(agg.byPlayer as any, "blocks_solo", 8),
+      blockersByAssist: topNForKey(agg.byPlayer as any, "blocks_assist", 8),
     };
+
+    // Positions if present in the stats table (helpful but not required)
+    const positions: Record<string, string | null> = {};
+    for (const p of Object.keys(agg.byPlayer)) positions[p] = agg.byPlayer[p].position ?? null;
+
+    return { type: "lineup", ...base, candidates, positions, notes };
   }
 
-  // Passing questions: support top N + month-by-month top passers
+  // PASSING: top N or each month
   if (isPassingQuestion(question)) {
     const wantsTop3 = q.includes("top 3") || q.includes("top three");
     const wantsTop5 = q.includes("top 5") || q.includes("top five");
     const n = wantsTop5 ? 5 : wantsTop3 ? 3 : 1;
 
+    const wantsEachMonth = q.includes("each month") || q.includes("per month") || q.includes("month");
     const overallTop = topNPassersOverall(agg.byPlayer, Math.max(n, 5)).map((r) => ({
       player: r.player,
       rating: Number(r.rating.toFixed(2)),
       attempts: r.attempts,
     }));
-
-    const wantsEachMonth = q.includes("each month") || q.includes("per month") || q.includes("month");
     const byMonthTop5 = wantsEachMonth ? topNPassersEachMonth(agg.passerByMonth, 5) : null;
 
-    return {
-      type: "serve_receive",
-      ...base,
-      requested: { topN: n, eachMonth: wantsEachMonth },
-      overallTop,
-      byMonthTop5,
-    };
+    return { type: "serve_receive", ...base, requested: { topN: n, eachMonth: wantsEachMonth }, overallTop, byMonthTop5 };
   }
 
-  // Leaders questions: top 5 across a set of common keys
+  // LEADERS: top 5 across common keys
   if (isLeadersQuestion(question)) {
     const commonKeys = [
       "attack_kills",
@@ -611,19 +510,13 @@ function buildFactsPayload(question: string, agg: ReturnType<typeof computeAggre
       if (rows.length) leaderboards[key] = rows;
     }
 
-    return {
-      type: "leaderboards",
-      ...base,
-      leaderboards,
-      note: "Leaderboards are computed by summing each stat across all matches in the 2025–26 window.",
-    };
+    return { type: "leaderboards", ...base, leaderboards };
   }
 
-  // Month-by-month for ANY stat key
+  // MONTH BY MONTH: for any inferred stat key + always SR by month if present
   if (isMonthByMonthQuestion(question)) {
     const key = inferStatKeyFromQuestion(question);
 
-    // Team SR by month always available if SR exists
     const teamServeReceiveByMonth = Object.keys(agg.srByMonth)
       .sort()
       .map((m) => {
@@ -632,7 +525,6 @@ function buildFactsPayload(question: string, agg: ReturnType<typeof computeAggre
         return { month: m, scale: "0-3", rating: Number(r.toFixed(2)), attempts: x.attempts };
       });
 
-    // Any numeric stat key month-by-month totals
     const statByMonth =
       key && Object.keys(agg.teamByMonth).length
         ? Object.keys(agg.teamByMonth)
@@ -640,16 +532,10 @@ function buildFactsPayload(question: string, agg: ReturnType<typeof computeAggre
             .map((m) => ({ month: m, key, value: toNum(agg.teamByMonth[m]?.[key]) }))
         : null;
 
-    return {
-      type: "month_over_month",
-      ...base,
-      inferredKey: key || null,
-      statByMonth,
-      teamServeReceiveByMonth,
-    };
+    return { type: "month_over_month", ...base, inferredKey: key || null, statByMonth, teamServeReceiveByMonth };
   }
 
-  // Broad coaching: include a compact snapshot across key areas
+  // BROAD: narrative snapshot
   if (isBroadQuestion(question)) {
     const snapshot = {
       killsTop5: topNForKey(agg.byPlayer as any, "attack_kills", 5),
@@ -667,24 +553,17 @@ function buildFactsPayload(question: string, agg: ReturnType<typeof computeAggre
       })),
     };
 
-    return {
-      type: "broad_coaching",
-      ...base,
-      snapshot,
-      notes,
-    };
+    return { type: "broad_coaching", ...base, snapshot, notes };
   }
 
-  // Minimal fallback facts
   return { type: "minimal", ...base };
 }
 
-/** ---------------------- OpenAI call (snappy + correct) ---------------------- **/
+/** ---------------------- OpenAI call ---------------------- **/
 
 function safeExtractOutputText(json: any): string {
   let text = "";
   const out = json?.output;
-
   if (Array.isArray(out)) {
     for (const item of out) {
       const content = item?.content;
@@ -695,10 +574,8 @@ function safeExtractOutputText(json: any): string {
       }
     }
   }
-
   if (!text && typeof json?.output_text === "string") text = json.output_text;
   if (!text && typeof json?.text === "string") text = json.text;
-
   return (text || "").trim();
 }
 
@@ -707,12 +584,10 @@ async function callOpenAI(question: string, factsPayload: any) {
   const model = process.env.OPENAI_MODEL ?? "gpt-5-mini";
 
   const broad = isBroadQuestion(question);
-  const narrow = !broad && !isLineupQuestion(question) && !isMonthByMonthQuestion(question) && !isLeadersQuestion(question);
-
-  // Smaller token budgets = faster responses
-  const maxTokens = broad ? 1000 : narrow ? 350 : 700;
-
   const askedForPrompts = isPromptsQuestion(question);
+
+  // Snappier: smaller token budgets (still enough for narrative)
+  const maxTokens = broad ? 950 : 350;
 
   const system = `
 You are "${PERSONA}" for MVVC 14 Black boys volleyball.
@@ -723,22 +598,23 @@ Hard rules:
 - Do NOT echo the question.
 - Do NOT dump unrelated stats.
 - Do NOT output "Try these prompts" unless the user asked for prompts.
-- Do NOT use hyphen dividers (no "-----") and do NOT use hyphen bullets.
-  Use short headings and either numbered lists or • bullets.
+- No hyphen dividers like "-----" and no hyphen bullets.
+  Use short headings and numbered lists or • bullets.
 
 Facts:
-- You receive FACTS_JSON which is the ONLY source of factual claims.
-- If the needed fact is missing, say what's missing and how to fix it.
+- FACTS_JSON is the ONLY source of factual claims.
+- If a specific fact is missing, say what's missing, but STILL give a best-effort coaching answer using what you do have.
 
-Response behavior by type:
-- If FACTS_JSON.type === "definition": give a clean volleyball definition (no season recap).
-- If type === "lineup": answer as a lineup (especially for 6-2). Provide a best-effort lineup + rotation logic.
-- If type === "serve_receive": if asked for top 3/5, list top 3/5 (not just one). If asked by month, show month blocks.
-- If type === "leaderboards": show top 5 across key categories, grouped by category.
-- If type === "month_over_month": show month-by-month for the inferred stat; if no stat inferred, ask what stat they want and suggest 3 examples.
-- If type === "broad_coaching": write a real narrative (12–30 lines). Include practical next steps.
+Type-specific behavior:
+- type="definition": give a clean definition (no season recap).
+- type="lineup": answer as a lineup, especially for 6-2.
+  Use available facts: setting_assists, attack_kills, SR rating, blocks. If positions are unclear, state assumptions and provide 2 lineup options.
+- type="broad_coaching": write a real narrative (12–30 lines) with practical next steps.
+- type="serve_receive": if asked top 3/5, list top 3/5. If by month, show month blocks.
+- type="leaderboards": show top 5 by category.
+- type="month_over_month": show month-by-month for inferred stat; if none inferred, ask what stat and suggest 3 examples.
 
-Make sure you mention what is data-backed vs coaching inference naturally in the wording (but do NOT create separate sections unless it helps clarity).
+Also: mention what is data-backed vs coaching inference in natural language (no separate sections required).
 `;
 
   const userObj = { question, FACTS_JSON: factsPayload };
@@ -767,128 +643,158 @@ Make sure you mention what is data-backed vs coaching inference naturally in the
   const json = await res.json();
   const answer = safeExtractOutputText(json);
 
-  // If user didn't ask for prompts, discourage prompt-dumping (instruction should already prevent it)
+  // Don’t allow prompt-dumping unless asked
   if (!askedForPrompts && answer.toLowerCase().includes("try:")) return answer;
 
   return answer;
 }
 
-/** ---------------------- Deterministic fallback (still answers) ---------------------- **/
+/** ---------------------- Fallback (must still answer well) ---------------------- **/
 
 function fallbackAnswer(question: string, factsPayload: any) {
   const t = s(question);
   const lines: string[] = [];
 
   if (factsPayload?.type === "definition") {
-    lines.push("A 6-2 offense (simple definition)");
-    lines.push("A 6-2 means you play two setters and they set only when they are in the back row.");
-    lines.push("That keeps three front-row hitters available at all times, but requires subs and good serve-receive to run smoothly.");
+    lines.push("6-2 offense (simple definition)");
+    lines.push("A 6-2 means you use two setters, and whoever is in the back row sets.");
+    lines.push("That keeps three front-row attackers available, but it requires subs and consistent serve-receive to run cleanly.");
     return lines.join("\n");
   }
 
-  if (factsPayload?.type === "serve_receive") {
-    const n = factsPayload?.requested?.topN ?? 1;
-    const overall = factsPayload?.overallTop ?? [];
-    const byMonth = factsPayload?.byMonthTop5 ?? null;
-
-    if (byMonth && (t.includes("each month") || t.includes("per month") || t.includes("month"))) {
-      lines.push("Top passers each month (0–3 serve-receive)");
-      for (const block of byMonth) {
-        lines.push(`${block.month}`);
-        const rows = (block.rows ?? []).slice(0, 5);
-        for (let i = 0; i < rows.length; i++) {
-          const r = rows[i];
-          lines.push(`${i + 1}) ${fmtName(r.player)}  ${Number(r.rating).toFixed(2)} on ${r.attempts}`);
-        }
-        lines.push("");
-      }
-      return lines.join("\n").trim();
-    }
-
-    lines.push(n === 1 ? "Best passer rating (0–3 serve-receive)" : `Top ${n} passers (0–3 serve-receive)`);
-    if (!overall.length) {
-      lines.push("Insufficient data in the current dataset.");
-      lines.push("Missing serve_receive_attempts and serve_receive_passing_rating fields in player stats.");
-      return lines.join("\n");
-    }
-    const slice = overall.slice(0, n);
-    for (let i = 0; i < slice.length; i++) {
-      const r = slice[i];
-      lines.push(`${i + 1}) ${fmtName(r.player)}  ${Number(r.rating).toFixed(2)} on ${r.attempts} attempts`);
-    }
-    return lines.join("\n");
-  }
-
-  if (factsPayload?.type === "leaderboards") {
-    lines.push("Top 5 leaders by category (season totals, 2025–26)");
-
-    const pretty: Record<string, string> = {
-      attack_kills: "Kills",
-      digs_successful: "Digs",
-      serve_aces: "Aces",
-      serve_errors: "Serve errors",
-      setting_assists: "Assists",
-      setting_errors: "Setting errors",
-      blocks_solo: "Solo blocks",
-      blocks_assist: "Block assists",
-      attack_errors: "Attack errors",
-      attack_attempts: "Attack attempts",
-    };
-
-    const lb = factsPayload?.leaderboards ?? {};
-    const keys = Object.keys(pretty).filter((k) => Array.isArray(lb[k]) && lb[k].length);
-
-    if (!keys.length) {
-      lines.push("Insufficient data in the current dataset.");
-      lines.push("Missing player_game_stats rows within the 2025–26 window.");
-      return lines.join("\n");
-    }
-
-    for (const k of keys) {
-      lines.push("");
-      lines.push(pretty[k] ?? k);
-      const rows = lb[k].slice(0, 5);
-      for (let i = 0; i < rows.length; i++) {
-        lines.push(`${i + 1}) ${fmtName(rows[i].player)}  ${rows[i].value}`);
-      }
-    }
-    return lines.join("\n").trim();
-  }
-
-  if (factsPayload?.type === "month_over_month") {
-    const inferred = factsPayload?.inferredKey;
-    if (!inferred || !factsPayload?.statByMonth) {
-      lines.push("Month-by-month tracking");
-      lines.push("Tell me which stat you want month-by-month (examples: kills, aces, digs, assists, serve errors).");
-      return lines.join("\n");
-    }
-    lines.push(`Month-by-month team totals: ${inferred}`);
-    for (const row of factsPayload.statByMonth) {
-      lines.push(`${row.month}: ${row.value}`);
-    }
-    return lines.join("\n");
-  }
-
+  // IMPORTANT FIX: lineup fallback MUST actually give a lineup, even with imperfect data.
   if (factsPayload?.type === "lineup") {
-    lines.push("Projected lineup (best-effort)");
-    lines.push("Insufficient data in the current dataset to lock positions/rotations cleanly.");
-    lines.push("To improve: ensure roster notes include each player’s primary position(s), and confirm who your two setters are for a true 6-2.");
-    return lines.join("\n");
-  }
-
-  // Broad default
-  if (isBroadQuestion(question)) {
     const wl = factsPayload?.winLoss;
-    lines.push("Coach recap (best-effort)");
-    if (wl) lines.push(`Record: ${wl.wins}-${wl.losses}`);
-    lines.push("I can give a stronger narrative once we confirm: primary positions, rotation preferences, and whether you prioritize sideout stability or point scoring.");
+    const teamSR = factsPayload?.teamServeReceive;
+    const c = factsPayload?.candidates ?? {};
+
+    const setters = (c.settersByAssists ?? []).slice(0, 4);
+    const passers = (c.passersBySR ?? []).slice(0, 5);
+    const hitters = (c.hittersByKills ?? []).slice(0, 8);
+    const blockersSolo = (c.blockersBySolo ?? []).slice(0, 6);
+    const blockersAssist = (c.blockersByAssist ?? []).slice(0, 6);
+
+    lines.push("Projected 6-2 lineup (best-effort from available stats)");
+
+    if (wl) lines.push(`Data-backed context: record ${wl.wins}-${wl.losses}`);
+    if (teamSR) lines.push(`Data-backed context: team SR ${teamSR.rating.toFixed(2)} (0–3) across ${teamSR.attempts} attempts`);
+
+    // Choose 2 setters by assists
+    if (setters.length >= 2) {
+      lines.push("");
+      lines.push("Setters (2)");
+      lines.push(`1) ${fmtName(setters[0].player)}  assists ${setters[0].value}`);
+      lines.push(`2) ${fmtName(setters[1].player)}  assists ${setters[1].value}`);
+    } else {
+      lines.push("");
+      lines.push("Setters (2)");
+      lines.push("Insufficient setting_assists data to confidently pick two setters.");
+    }
+
+    // Choose passers/DS by SR
+    if (passers.length) {
+      lines.push("");
+      lines.push("Primary passers / DS core (stability for sideout)");
+      const top = passers.slice(0, 3);
+      for (let i = 0; i < top.length; i++) {
+        const p = top[i];
+        lines.push(`${i + 1}) ${fmtName(p.player)}  SR ${Number(p.rating).toFixed(2)} on ${p.attempts}`);
+      }
+    }
+
+    // Choose attackers by kills
+    if (hitters.length) {
+      lines.push("");
+      lines.push("Attackers to build around (kills)");
+      const top = hitters.slice(0, 4);
+      for (let i = 0; i < top.length; i++) {
+        const h = top[i];
+        lines.push(`${i + 1}) ${fmtName(h.player)}  kills ${h.value}`);
+      }
+    }
+
+    // Net presence if blocks exist
+    const net = [...blockersSolo, ...blockersAssist]
+      .reduce<Record<string, number>>((acc, r) => {
+        acc[r.player] = (acc[r.player] ?? 0) + (r.value ?? 0);
+        return acc;
+      }, {});
+    const netRows = Object.keys(net)
+      .map((p) => ({ player: p, value: net[p] }))
+      .sort((a, b) => b.value - a.value)
+      .slice(0, 3);
+
+    if (netRows.length) {
+      lines.push("");
+      lines.push("Net presence (blocks proxy)");
+      for (let i = 0; i < netRows.length; i++) {
+        lines.push(`${i + 1}) ${fmtName(netRows[i].player)}  blocks ${netRows[i].value}`);
+      }
+    }
+
+    lines.push("");
+    lines.push("How to run the 6-2 (coaching inference)");
+    lines.push("Use your two highest-assist players as setters; have them set from the back row only.");
+    lines.push("Make your top 2–3 SR players the backbone of serve-receive so your offense stays in-system.");
+    lines.push("Opposite selection: use your highest-kill attackers who are NOT one of the two setters (if you confirm positions, I’ll lock this precisely).");
+
+    lines.push("");
+    lines.push("What I still need to make this rotation-by-rotation accurate");
+    lines.push("Confirm each player’s primary position (S/OH/OPP/MB/L/DS) and who you want as the two setters.");
+
     return lines.join("\n");
   }
 
+  // IMPORTANT FIX: broad recap must actually recap using snapshot
+  if (factsPayload?.type === "broad_coaching") {
+    const wl = factsPayload?.winLoss;
+    const teamSR = factsPayload?.teamServeReceive;
+    const snap = factsPayload?.snapshot ?? {};
+    const trouble = factsPayload?.troubleOpponents ?? [];
+
+    lines.push("Season recap (data-backed + coaching read)");
+
+    if (wl) lines.push(`Data-backed: record ${wl.wins}-${wl.losses}`);
+    if (teamSR) lines.push(`Data-backed: team SR ${teamSR.rating.toFixed(2)} (0–3) across ${teamSR.attempts} attempts`);
+
+    const killsL = snap?.killsTop5?.[0];
+    const digsL = snap?.digsTop5?.[0];
+    const acesL = snap?.acesTop5?.[0];
+    const serveErrL = snap?.serveErrorsTop5?.[0];
+    const bestP = snap?.bestPassersTop5?.[0];
+
+    lines.push("");
+    lines.push("What the numbers say you are");
+    if (killsL) lines.push(`Your primary finisher: ${fmtName(killsL.player)} leads kills (${killsL.value}).`);
+    if (digsL) lines.push(`Your highest dig production: ${fmtName(digsL.player)} leads digs (${digsL.value}).`);
+    if (acesL) lines.push(`Your top point pressure from the line: ${fmtName(acesL.player)} leads aces (${acesL.value}).`);
+    if (bestP) lines.push(`Your most stable passer (SR): ${fmtName(bestP.player)} at ${bestP.rating.toFixed(2)} on ${bestP.attempts} attempts.`);
+    if (serveErrL) lines.push(`Your biggest volatility flag: ${fmtName(serveErrL.player)} has the most serve errors (${serveErrL.value}).`);
+
+    if (Array.isArray(trouble) && trouble.length) {
+      lines.push("");
+      lines.push("Where you’ve struggled most (data-backed)");
+      const top = trouble.slice(0, 3);
+      for (let i = 0; i < top.length; i++) {
+        lines.push(`${i + 1}) ${top[i].opponent}  losses ${top[i].losses}/${top[i].matches}`);
+      }
+      lines.push("Coaching inference: those opponents likely win the serve/pass battle or trap you in a rotation.");
+    }
+
+    lines.push("");
+    lines.push("Practical next steps (coaching inference)");
+    lines.push("1) Serve-receive: build your primary pattern around the top 2–3 passers and simplify seam responsibilities.");
+    lines.push("2) Serving: keep aggression but reduce free points—pick 2 target zones per match and track net vs long vs wide misses.");
+    lines.push("3) Against trouble opponents: pre-write a plan—serve targets, SR seam ownership, and a rotation escape plan.");
+
+    return lines.join("\n");
+  }
+
+  // Minimal
   return "I couldn’t generate a response from the current data.";
 }
 
-/** ---------------------- Route handler ---------------------- **/
+/** ---------------------- Route ---------------------- **/
 
 export async function POST(req: Request) {
   try {
@@ -896,28 +802,30 @@ export async function POST(req: Request) {
     const question = String(body?.question ?? "").trim();
     if (!question) return NextResponse.json({ error: "question is required" }, { status: 400 });
 
-    // 1) Fast fetch
+    // 1) Fetch
     const { chunks, matches, statsRows } = await retrieveData(TEAM_ID, question);
 
     // 2) Aggregate once
     const agg = computeAggregates(matches, statsRows);
 
-    // 3) Notes for broad/roster/lineup questions only (reduces noise + latency)
+    // 3) Notes only when helpful
     const notes = (isBroadQuestion(question) || isRosterQuestion(question) || isLineupQuestion(question)) ? buildNotes(chunks) : "";
 
-    // 4) Question-specific facts payload (this is the key to “no noise”)
+    // 4) Facts payload tuned to the question (prevents “noise”)
     const factsPayload = buildFactsPayload(question, agg, notes);
 
-    // 5) Call OpenAI (or fallback)
+    // 5) OpenAI (or fallback). Log failures so you can debug Vercel.
     let answer = "";
     try {
       answer = await callOpenAI(question, factsPayload);
-    } catch {
+    } catch (err: any) {
+      console.error("[OpenAI]", err?.message ?? String(err));
       answer = "";
     }
+
     if (!answer) answer = fallbackAnswer(question, factsPayload);
 
-    // 6) Highlight all known players consistently
+    // 6) Always highlight ALL player names we know about
     const playerNames = Object.keys(agg.byPlayer || {});
     answer = highlightAllPlayerNames(answer, playerNames);
 
