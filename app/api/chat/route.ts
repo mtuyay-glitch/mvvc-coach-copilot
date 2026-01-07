@@ -1,14 +1,32 @@
 import { NextResponse } from "next/server";
 import { supabaseService } from "../../../lib/supabaseServer";
 
-/** Hard-coded team + season */
-const TEAM_ID = "7d5c9d23-e78c-4b08-8869-64cece1acee5"; // MVVC 14 Black
-const DEFAULT_SEASON: "fall" | "spring" | "summer" = "spring";
-
-/** Helpers */
 function assertEnv(name: string) {
   if (!process.env[name]) throw new Error(`Missing env var: ${name}`);
 }
+
+const TEAM_ID = "7d5c9d23-e78c-4b08-8869-64cece1acee5"; // MVVC 14 Black
+const DEFAULT_SEASON = "spring"; // change to "fall" if you want your default season
+
+type MatchRow = {
+  match_date: string | null;
+  tournament: string | null;
+  opponent: string | null;
+  result: string | null; // "W"/"L" or "Won"/"Lost"
+  score: string | null;
+  round: string | null;
+  sets_won: number | null;
+  sets_lost: number | null;
+  set_diff: number | null;
+};
+
+type StatRow = {
+  player_name: string | null;
+  position: string | null;
+  game_date: string | null;
+  opponent: string | null;
+  stats: any; // jsonb from supabase (may arrive as object or stringified json)
+};
 
 function toNum(v: any): number {
   if (v === null || v === undefined) return 0;
@@ -19,221 +37,340 @@ function toNum(v: any): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-function parseStats(raw: any): Record<string, any> {
-  if (!raw) return {};
-  if (typeof raw === "object") return raw;
-  if (typeof raw === "string") {
-    const t = raw.trim();
-    if (!t) return {};
-    try {
-      return JSON.parse(t);
-    } catch {
-      return {};
-    }
+function parseStats(stats: any): Record<string, any> {
+  if (!stats) return {};
+  if (typeof stats === "object") return stats;
+  try {
+    return JSON.parse(stats);
+  } catch {
+    return {};
   }
-  return {};
 }
 
-type PlayerTotals = {
-  kills: number;
-  digs: number;
-  aces: number;
-  serveErrors: number;
-  srAttempts: number;
-  srRatingSum: number; // rating * attempts
-};
-
-function computePlayerTotals(statsRows: any[]) {
-  const totals = new Map<string, PlayerTotals>();
-
-  for (const row of statsRows) {
-    const player = String(row.player_name ?? "").trim();
-    if (!player) continue;
-
-    const s = parseStats(row.stats);
-
-    const kills = toNum(s.attack_kills);
-    const digs = toNum(s.digs_successful);
-    const aces = toNum(s.serve_aces);
-    const serveErrors = toNum(s.serve_errors);
-
-    const srAttempts = toNum(s.serve_receive_attempts);
-    const srRating = toNum(s.serve_receive_passing_rating);
-    const srRatingSum = srAttempts > 0 ? srRating * srAttempts : 0;
-
-    const prev =
-      totals.get(player) ?? ({
-        kills: 0,
-        digs: 0,
-        aces: 0,
-        serveErrors: 0,
-        srAttempts: 0,
-        srRatingSum: 0,
-      } as PlayerTotals);
-
-    prev.kills += kills;
-    prev.digs += digs;
-    prev.aces += aces;
-    prev.serveErrors += serveErrors;
-    prev.srAttempts += srAttempts;
-    prev.srRatingSum += srRatingSum;
-
-    totals.set(player, prev);
-  }
-
-  const out: Array<{
-    player: string;
-    kills: number;
-    digs: number;
-    aces: number;
-    serveErrors: number;
-    srAttempts: number;
-    srRating: number | null;
-  }> = [];
-
-  for (const [player, t] of Array.from(totals.entries())) {
-    const srRating = t.srAttempts > 0 ? t.srRatingSum / t.srAttempts : null;
-    out.push({
-      player,
-      kills: t.kills,
-      digs: t.digs,
-      aces: t.aces,
-      serveErrors: t.serveErrors,
-      srAttempts: t.srAttempts,
-      srRating,
-    });
-  }
-
-  return out;
+function normalizeWinLoss(result: string | null): "W" | "L" | null {
+  if (!result) return null;
+  const r = result.toLowerCase();
+  if (r === "w" || r.includes("won") || r.includes("win")) return "W";
+  if (r === "l" || r.includes("lost") || r.includes("loss")) return "L";
+  return null;
 }
 
-function topN<T>(arr: T[], n: number, getVal: (x: T) => number) {
-  return [...arr].sort((a, b) => getVal(b) - getVal(a)).slice(0, n);
-}
-
-function safeOpponentName(x: any) {
-  return String(x ?? "").trim();
-}
-
-async function retrieveData(teamId: string, season: "fall" | "spring" | "summer") {
+async function retrieveContext(teamId: string, season: string, question: string) {
   const supabase = supabaseService();
 
+  // A) Roster chunks always
+  const { data: rosterChunks, error: er } = await supabase
+    .from("knowledge_chunks")
+    .select("id,title,content,tags")
+    .eq("team_id", teamId)
+    .contains("tags", ["roster"])
+    .limit(5);
+  if (er) throw er;
+
+  // B) Season-specific notes by search (optional, helpful for lineup rules / injuries)
+  const cleaned = question.replace(/[^a-zA-Z0-9 ]/g, " ");
+  const { data: searchChunks, error: e1 } = await supabase
+    .from("knowledge_chunks")
+    .select("id,title,content,tags")
+    .eq("team_id", teamId)
+    .eq("season", season)
+    .textSearch("tsv", cleaned, { type: "websearch" })
+    .limit(6);
+  if (e1) throw e1;
+
+  // Merge + dedupe
+  const mergedMap = new Map<number, any>();
+  (rosterChunks ?? []).forEach((c: any) => mergedMap.set(c.id, c));
+  (searchChunks ?? []).forEach((c: any) => mergedMap.set(c.id, c));
+  const chunks = Array.from(mergedMap.values());
+
+  // C) Match results
   const { data: matches, error: em } = await supabase
     .from("match_results")
     .select("match_date,tournament,opponent,result,score,round,sets_won,sets_lost,set_diff")
     .eq("team_id", teamId)
     .order("match_date", { ascending: true })
-    .limit(5000);
+    .limit(400);
   if (em) throw em;
 
+  // D) Player stat rows (raw rows, we compute light aggregates below)
   const { data: statsRows, error: es } = await supabase
     .from("player_game_stats")
-    .select("player_name,position,game_date,opponent,stats,season")
+    .select("player_name,position,game_date,opponent,stats")
     .eq("team_id", teamId)
     .eq("season", season)
     .order("game_date", { ascending: false })
-    .limit(5000);
+    .limit(1200);
   if (es) throw es;
 
-  return { matches: matches ?? [], statsRows: statsRows ?? [] };
+  return { chunks: chunks ?? [], matches: (matches ?? []) as MatchRow[], statsRows: (statsRows ?? []) as StatRow[] };
 }
 
-function computeWinLoss(matches: any[]) {
+function computeFacts(matches: MatchRow[], statsRows: StatRow[]) {
+  // --- Win/Loss
   let wins = 0;
   let losses = 0;
-  for (const m of matches) {
-    const r = String(m.result ?? "").toLowerCase();
-    if (r.includes("won") || r === "w") wins++;
-    else if (r.includes("lost") || r === "l") losses++;
-  }
-  return { wins, losses, total: wins + losses };
-}
 
-function computeTroubleOpponents(matches: any[]) {
-  const map = new Map<string, { losses: number; matches: number; setDiff: number }>();
+  // opponent loss counts + set diff sums
+  const oppLosses: Record<string, number> = {};
+  const oppMatches: Record<string, number> = {};
+  const oppSetDiff: Record<string, number> = {};
 
   for (const m of matches) {
-    const opp = safeOpponentName(m.opponent);
-    if (!opp) continue;
+    const wl = normalizeWinLoss(m.result);
+    const opp = (m.opponent ?? "").trim() || "Unknown Opponent";
+    oppMatches[opp] = (oppMatches[opp] ?? 0) + 1;
 
-    const r = String(m.result ?? "").toLowerCase();
-    const isLoss = r.includes("lost") || r === "l";
+    if (wl === "W") wins++;
+    if (wl === "L") {
+      losses++;
+      oppLosses[opp] = (oppLosses[opp] ?? 0) + 1;
+    }
     const sd = toNum(m.set_diff);
-
-    const prev = map.get(opp) ?? { losses: 0, matches: 0, setDiff: 0 };
-    prev.matches += 1;
-    prev.losses += isLoss ? 1 : 0;
-    prev.setDiff += sd;
-    map.set(opp, prev);
+    oppSetDiff[opp] = (oppSetDiff[opp] ?? 0) + sd;
   }
 
-  const arr = Array.from(map.entries()).map(([opponent, v]) => ({
-    opponent,
-    losses: v.losses,
-    matches: v.matches,
-    setDiff: v.setDiff,
-  }));
+  // --- Player totals + weighted SR rating
+  type Tot = {
+    kills: number;
+    digs: number;
+    aces: number;
+    serveErrors: number;
 
-  arr.sort((a, b) => {
-    if (b.losses !== a.losses) return b.losses - a.losses;
-    return a.setDiff - b.setDiff; // more negative = worse
-  });
+    srAttempts: number;
+    srWeightedSum: number;
+  };
 
-  return arr.slice(0, 8);
+  const totals: Record<string, Tot> = {};
+
+  function ensure(player: string): Tot {
+    if (!totals[player]) {
+      totals[player] = { kills: 0, digs: 0, aces: 0, serveErrors: 0, srAttempts: 0, srWeightedSum: 0 };
+    }
+    return totals[player];
+  }
+
+  for (const row of statsRows) {
+    const player = (row.player_name ?? "").trim();
+    if (!player) continue;
+
+    const s = parseStats(row.stats);
+
+    const t = ensure(player);
+
+    // common fields based on your JSON sample
+    t.kills += toNum(s.attack_kills);
+    t.digs += toNum(s.digs_successful);
+    t.aces += toNum(s.serve_aces);
+    t.serveErrors += toNum(s.serve_errors);
+
+    const srAtt = toNum(s.serve_receive_attempts);
+    const srRating = toNum(s.serve_receive_passing_rating); // 0–3 scale
+    if (srAtt > 0) {
+      t.srAttempts += srAtt;
+      t.srWeightedSum += srRating * srAtt;
+    }
+  }
+
+  function leader(metric: keyof Tot) {
+    let bestPlayer = "";
+    let bestVal = -Infinity;
+    for (const player of Object.keys(totals)) {
+      const v = totals[player][metric];
+      if (v > bestVal) {
+        bestVal = v;
+        bestPlayer = player;
+      }
+    }
+    return bestPlayer ? { player: bestPlayer, value: bestVal } : null;
+  }
+
+  // Best passer rating (weighted)
+  let bestPasser = "";
+  let bestPasserRating = -Infinity;
+  let bestPasserAtt = 0;
+
+  for (const player of Object.keys(totals)) {
+    const t = totals[player];
+    if (t.srAttempts <= 0) continue;
+    const r = t.srWeightedSum / t.srAttempts;
+    if (r > bestPasserRating) {
+      bestPasserRating = r;
+      bestPasser = player;
+      bestPasserAtt = t.srAttempts;
+    }
+  }
+
+  // Team SR rating
+  let teamSrAtt = 0;
+  let teamSrSum = 0;
+  for (const player of Object.keys(totals)) {
+    teamSrAtt += totals[player].srAttempts;
+    teamSrSum += totals[player].srWeightedSum;
+  }
+  const teamSrRating = teamSrAtt > 0 ? teamSrSum / teamSrAtt : 0;
+
+  // Opponents causing trouble: sort by losses desc, then by set diff asc (more negative is worse)
+  const opps = Object.keys(oppMatches);
+  const trouble = opps
+    .map((opp) => ({
+      opponent: opp,
+      losses: oppLosses[opp] ?? 0,
+      matches: oppMatches[opp] ?? 0,
+      setDiff: oppSetDiff[opp] ?? 0,
+    }))
+    .filter((x) => x.losses > 0)
+    .sort((a, b) => {
+      if (b.losses !== a.losses) return b.losses - a.losses;
+      return a.setDiff - b.setDiff;
+    })
+    .slice(0, 6);
+
+  return {
+    wins,
+    losses,
+    leaders: {
+      kills: leader("kills"),
+      digs: leader("digs"),
+      aces: leader("aces"),
+      serveErrors: leader("serveErrors"),
+    },
+    bestPasser: bestPasser
+      ? { player: bestPasser, rating: bestPasserRating, attempts: bestPasserAtt, teamRating: teamSrRating }
+      : null,
+    trouble,
+    hasStats: Object.keys(totals).length > 0,
+    hasMatches: matches.length > 0,
+  };
 }
 
-/** Detect common question intents so we can answer directly */
-function detectIntent(q: string) {
-  const s = q.toLowerCase();
-  const isPasser =
-    s.includes("passer rating") ||
-    s.includes("passing rating") ||
-    s.includes("serve receive") ||
-    s.includes("serve-receive") ||
-    s.includes("sr rating") ||
-    s.includes("best passer");
-
-  const isWinLoss =
-    s.includes("win loss") || s.includes("win-loss") || s.includes("record") || s.includes("w-l");
-
-  const isKillsLeader =
-    s.includes("leads") && s.includes("kills") ||
-    s.includes("most kills") ||
-    s.includes("kills leader");
-
-  const isTroubleOpp =
-    s.includes("most trouble") ||
-    s.includes("hardest opponent") ||
-    s.includes("toughest opponent") ||
-    s.includes("which opponents");
-
-  return { isPasser, isWinLoss, isKillsLeader, isTroubleOpp };
-}
-
-function formatAnswer(opts: { facts: string[]; insight?: string[] }) {
+function buildNotesBlock(chunks: any[]) {
+  if (!chunks.length) return "";
   const lines: string[] = [];
-  lines.push(`Data-Backed (Facts)`);
-  lines.push(`-------------------`);
-  lines.push(...opts.facts);
+  for (const c of chunks) {
+    const title = (c.title ?? "").toString().trim();
+    const content = (c.content ?? "").toString().trim();
+    if (!title && !content) continue;
+    lines.push(`- ${title}\n${content}`);
+  }
+  return lines.join("\n\n");
+}
 
-  lines.push(``);
-  lines.push(`Coaching Insight (Inference)`);
-  lines.push(`----------------------------`);
-  if (opts.insight && opts.insight.length) lines.push(...opts.insight);
-  else lines.push(`• Ask a follow-up angle (rotation, matchups, serve/receive, opponents) and I’ll tailor recommendations.`);
+function buildFactsBlock(facts: ReturnType<typeof computeFacts>) {
+  const lines: string[] = [];
+
+  lines.push("Data-Backed (Facts)");
+  lines.push("-------------------");
+
+  if (!facts.hasMatches && !facts.hasStats) {
+    lines.push("Insufficient data in the current dataset.");
+    return lines.join("\n");
+  }
+
+  if (facts.hasMatches) {
+    lines.push(`Win/Loss (from match_results): ${facts.wins}-${facts.losses}`);
+  } else {
+    lines.push("Win/Loss: (match_results not found)");
+  }
+
+  lines.push("");
+  lines.push("__Team Leaders (season totals from player_game_stats)__");
+
+  const k = facts.leaders.kills;
+  const d = facts.leaders.digs;
+  const a = facts.leaders.aces;
+  const se = facts.leaders.serveErrors;
+
+  if (k) lines.push(`• **${k.player}** — ${k.value} kills`);
+  if (d) lines.push(`• **${d.player}** — ${d.value} digs`);
+  if (a) lines.push(`• **${a.player}** — ${a.value} aces`);
+  if (se) lines.push(`• **${se.player}** — ${se.value} serve errors`);
+
+  if (facts.bestPasser) {
+    lines.push("");
+    lines.push("__Serve-Receive (0–3 scale)__");
+    lines.push(
+      `• Best passer rating: **${facts.bestPasser.player}** — ${facts.bestPasser.rating.toFixed(2)} on ${facts.bestPasser.attempts} attempts`
+    );
+    lines.push(`• Team weighted SR rating: ${facts.bestPasser.teamRating.toFixed(2)} on ${facts.bestPasser.attempts ? "multiple players" : "0"} attempts`);
+  }
+
+  if (facts.trouble.length) {
+    lines.push("");
+    lines.push("__Opponents That Caused the Most Trouble__");
+    for (const t of facts.trouble) {
+      lines.push(`• **${t.opponent}** — losses: ${t.losses}/${t.matches}, set diff: ${t.setDiff}`);
+    }
+  }
 
   return lines.join("\n");
 }
 
-/** Optional OpenAI narrative polish (kept, but NOT required for an answer) */
-async function callOpenAI(prompt: string) {
+function buildLLMInput(question: string, factsBlock: string, notesBlock: string) {
+  const parts: string[] = [];
+  parts.push(`QUESTION:\n${question}\n`);
+
+  parts.push(`FACTS BLOCK (use for Data-Backed facts only):\n${factsBlock}\n`);
+
+  if (notesBlock.trim()) {
+    parts.push(`TEAM NOTES (optional context):\n${notesBlock}\n`);
+  }
+
+  return parts.join("\n");
+}
+
+async function callOpenAI(question: string, factsBlock: string, notesBlock: string) {
   assertEnv("OPENAI_API_KEY");
   const model = process.env.OPENAI_MODEL ?? "gpt-5-mini";
 
+  const inputText = buildLLMInput(question, factsBlock, notesBlock);
+
   const res = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
-    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model, max_output_tokens: 700, input: prompt }),
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      max_output_tokens: 900,
+      input: [
+        {
+          role: "system",
+          content: [
+            {
+              type: "input_text",
+              text: `
+You are a volleyball Coaching Assistant for MVVC 14 Black.
+
+Write coach-friendly answers with:
+- Clean spacing and short bullets.
+- Two sections ONLY, in this exact order:
+
+Data-Backed (Facts)
+-------------------
+(only what is explicitly supported by the FACTS BLOCK)
+
+Coaching Insight (Inference)
+----------------------------
+(volleyball interpretation of those facts; make it practical: what it suggests, what to do next)
+
+Rules:
+- Data-Backed (Facts) must come ONLY from the FACTS BLOCK.
+- Coaching Insight (Inference) may use volleyball knowledge to interpret those facts.
+- Do NOT show citations like S3/K2/etc.
+- Make player names stand out subtly using **bold** (example: **Koa**).
+- If the FACTS BLOCK says "Insufficient data in the current dataset.", you must say that in Facts and then in Insight explain what data is missing + what to upload/track.
+`,
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [{ type: "input_text", text: inputText }],
+        },
+      ],
+    }),
   });
 
   if (!res.ok) {
@@ -241,178 +378,66 @@ async function callOpenAI(prompt: string) {
     throw new Error(`OpenAI error ${res.status}: ${txt}`);
   }
 
-  const json: any = await res.json();
-  if (typeof json.output_text === "string" && json.output_text.trim()) return json.output_text.trim();
-
+  const json = await res.json();
   const out = json.output ?? [];
   let text = "";
+
   for (const item of out) {
     const content = item.content ?? [];
     for (const c of content) {
       if (c.type === "output_text" && typeof c.text === "string") text += c.text;
     }
   }
+
   return (text || "").trim();
 }
 
 export async function POST(req: Request) {
   try {
-    const body = (await req.json()) as { question?: string };
+    const body = (await req.json()) as { question: string };
     const question = String(body.question ?? "").trim();
     if (!question) return NextResponse.json({ error: "question is required" }, { status: 400 });
 
     const teamId = TEAM_ID;
     const season = DEFAULT_SEASON;
 
-    const { matches, statsRows } = await retrieveData(teamId, season);
-    const { wins, losses } = computeWinLoss(matches);
-    const leaders = computePlayerTotals(statsRows);
-    const trouble = computeTroubleOpponents(matches);
+    const { chunks, matches, statsRows } = await retrieveContext(teamId, season, question);
+    const facts = computeFacts(matches, statsRows);
 
-    const intent = detectIntent(question);
+    const factsBlock = buildFactsBlock(facts);
+    const notesBlock = buildNotesBlock(chunks);
 
-    // Precompute leader candidates
-    const killsLeader = topN(leaders, 1, (x) => x.kills)[0];
-    const srCandidates = leaders.filter((x) => (x.srAttempts ?? 0) >= 10 && x.srRating !== null);
-    const srLeader = topN(srCandidates, 1, (x) => x.srRating ?? 0)[0];
-
-    // ✅ DIRECT ANSWERS FIRST
-    if (intent.isPasser) {
-      if (!srLeader) {
-        const answer = formatAnswer({
-          facts: [
-            `Short answer: Insufficient data in the current dataset to rank passer rating (need serve_receive_attempts and serve_receive_passing_rating).`,
-            ``,
-            `__What I looked for__`,
-            `• serve_receive_passing_rating (0–3 scale) weighted by serve_receive_attempts`,
-          ],
-          insight: [`• If your CSV has SR rating counts (0/1/2/3), we can also validate the rating calculation per player.`],
-        });
-        return NextResponse.json({ answer });
-      }
-
-      const answer = formatAnswer({
-        facts: [
-          `Short answer: **${srLeader.player}** has the best passer (serve-receive) rating — ${srLeader.srRating!.toFixed(
-            2
-          )} on ${srLeader.srAttempts} attempts (0–3 scale).`,
-          ``,
-          `__Supporting context__`,
-          `• Season: ${season}`,
-          `• Win/Loss (from match_results): ${wins}-${losses}`,
-        ],
-        insight: [
-          `• Treat **${srLeader.player}** as a primary serve-receive anchor. If you want, I can also list the top 5 passers and their attempt counts (confidence).`,
-        ],
-      });
-
-      return NextResponse.json({ answer });
-    }
-
-    if (intent.isWinLoss) {
-      const answer = formatAnswer({
-        facts: [
-          `Short answer: Win/Loss record is ${wins}-${losses} (from match_results).`,
-          ``,
-          `__Notes__`,
-          `• If you want “by tournament” records, I can break it down if tournament names are populated consistently.`,
-        ],
-        insight: [`• If you share your season goals (e.g., gold bracket finishes), I can summarize progress vs goal.`],
-      });
-      return NextResponse.json({ answer });
-    }
-
-    if (intent.isKillsLeader) {
-      if (!killsLeader) {
-        const answer = formatAnswer({
-          facts: [`Short answer: Insufficient data in the current dataset to identify a kills leader.`],
-          insight: [`• Make sure player_game_stats has attack_kills per player per match (it looks like it does—so this likely means season filter mismatch).`],
-        });
-        return NextResponse.json({ answer });
-      }
-
-      const answer = formatAnswer({
-        facts: [
-          `Short answer: **${killsLeader.player}** leads the team in kills — ${killsLeader.kills}.`,
-          ``,
-          `__Supporting context__`,
-          `• Season: ${season}`,
-        ],
-        insight: [`• If you want “kills per set” or “kills vs errors efficiency,” we can compute that too (if attempts/errors are present).`],
-      });
-      return NextResponse.json({ answer });
-    }
-
-    if (intent.isTroubleOpp) {
-      const top = trouble.slice(0, 5);
-      const answer = formatAnswer({
-        facts: [
-          `Short answer: These opponents caused the most trouble (by losses, then set differential):`,
-          ``,
-          `__Opponents__`,
-          ...top.map((t) => `• **${t.opponent}** — losses: ${t.losses}/${t.matches}, set diff: ${t.setDiff}`),
-        ],
-        insight: [`• If you tell me what “trouble” means for you (tight sets vs blowouts vs serve-receive breakdown), I can re-rank using that definition.`],
-      });
-      return NextResponse.json({ answer });
-    }
-
-    // Otherwise: use OpenAI for narrative, but keep it grounded in computed facts
-    const factsSummary = [
-      `Season: ${season}`,
-      `Win/Loss: ${wins}-${losses}`,
-      srLeader ? `Best SR rating: ${srLeader.player} ${srLeader.srRating!.toFixed(2)} on ${srLeader.srAttempts} att` : `Best SR rating: (not enough data)`,
-      killsLeader ? `Kills leader: ${killsLeader.player} ${killsLeader.kills}` : `Kills leader: (not enough data)`,
-    ].join("\n");
-
-    const prompt = `
-You are the MVVC volleyball Coaching Assistant.
-
-Write a coach-friendly response with great spacing.
-Format exactly:
-
-Data-Backed (Facts)
--------------------
-<answer the user question directly, then bullets>
-
-Coaching Insight (Inference)
-----------------------------
-<recommendations based on the facts>
-
-Rules:
-- Player names should be bold like **Name**.
-- Do not include citations or codes.
-- Facts must come ONLY from the facts block below.
-
-FACTS BLOCK:
-${factsSummary}
-
-USER QUESTION:
-${question}
-`.trim();
-
-    let aiText = "";
+    // Try OpenAI
+    let answer = "";
     try {
-      aiText = await callOpenAI(prompt);
-    } catch {
-      aiText = "";
+      answer = await callOpenAI(question, factsBlock, notesBlock);
+    } catch (e) {
+      // If OpenAI errors, we'll still return a useful response below.
+      answer = "";
     }
 
-    if (!aiText) {
-      // Fallback: never "No answer generated"
-      const answer = formatAnswer({
-        facts: [
-          `Short answer: I can’t generate a narrative answer right now, but your data is loaded.`,
-          ``,
-          `__Available facts__`,
-          `• ${factsSummary.replace(/\n/g, "\n• ")}`,
-        ],
-        insight: [`• Ask something like “top 5 passers”, “kills vs errors efficiency”, or “break down record by tournament”.`],
-      });
-      return NextResponse.json({ answer });
+    // Hard fallback so you don't get "No answer generated"
+    if (!answer) {
+      const fallbackLines: string[] = [];
+      fallbackLines.push("Data-Backed (Facts)");
+      fallbackLines.push("-------------------");
+      fallbackLines.push(factsBlock.replace(/^Data-Backed \(Facts\)\n-+\n?/m, "").trim() || "Insufficient data in the current dataset.");
+      fallbackLines.push("");
+      fallbackLines.push("Coaching Insight (Inference)");
+      fallbackLines.push("----------------------------");
+      if (!facts.hasMatches && !facts.hasStats) {
+        fallbackLines.push("Your tables returned no usable match_results or player_game_stats rows for this season/team. Re-import or confirm TEAM_ID + season + table contents.");
+      } else {
+        fallbackLines.push("Your data is loaded, but a full narrative summary needs more specific direction.");
+        fallbackLines.push("Try one of these:");
+        fallbackLines.push("• Strengths/weaknesses: ask “What do the leaders + win/loss pattern suggest we should focus on?”");
+        fallbackLines.push("• Opponent trouble: ask “Break down why our worst opponents were hard (serve pressure, sideout, errors).”");
+        fallbackLines.push("• Lineup: ask “Best starting six given passing + kills + blocks (if tracked).”");
+      }
+      answer = fallbackLines.join("\n");
     }
 
-    return NextResponse.json({ answer: aiText });
+    return NextResponse.json({ answer });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message ?? String(e) }, { status: 500 });
   }
