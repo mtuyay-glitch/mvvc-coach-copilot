@@ -32,24 +32,18 @@ export default function Page() {
 
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
-
-  // Thread id = “conversation memory key”
   const [threadId, setThreadId] = useState<string | null>(null);
 
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const THREAD_STORAGE_KEY = "mvvc_thread_id";
 
-  // Restore thread_id so chat persists across refreshes
   useEffect(() => {
     try {
       const saved = localStorage.getItem(THREAD_STORAGE_KEY);
       if (saved) setThreadId(saved);
-    } catch {
-      // ignore
-    }
+    } catch {}
   }, []);
 
-  // Auto-scroll to latest message
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages.length]);
@@ -57,10 +51,10 @@ export default function Page() {
   const canSend = useMemo(() => input.trim().length > 0 && !isSending, [input, isSending]);
 
   async function sendMessage() {
-    const message = input.trim();
-    if (!message || isSending) return;
+    const question = input.trim();
+    if (!question || isSending) return;
 
-    const userMsg: Message = { id: uid(), role: "user", text: message };
+    const userMsg: Message = { id: uid(), role: "user", text: question };
     setMessages((prev) => [...prev, userMsg]);
     setInput("");
     setIsSending(true);
@@ -72,44 +66,32 @@ export default function Page() {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        // IMPORTANT: new contract uses "message" (not "question")
-        body: JSON.stringify({
-          message,
-          thread_id: threadId,
-        }),
+        body: JSON.stringify({ question, thread_id: threadId }),
       });
 
       const data = await res.json();
 
       if (!res.ok) {
-        const errText =
-          typeof data?.error === "string" ? data.error : `Request failed (${res.status})`;
+        const errText = typeof data?.error === "string" ? data.error : `Request failed (${res.status})`;
         throw new Error(errText);
       }
 
-      // Persist thread_id for follow-up context
       if (data?.thread_id && typeof data.thread_id === "string") {
         const newThreadId = data.thread_id;
         if (newThreadId !== threadId) {
           setThreadId(newThreadId);
           try {
             localStorage.setItem(THREAD_STORAGE_KEY, newThreadId);
-          } catch {
-            // ignore
-          }
+          } catch {}
         }
       }
 
       const answer =
-        typeof data?.answer === "string" && data.answer.trim()
-          ? data.answer.trim()
-          : "No answer generated.";
+        typeof data?.answer === "string" && data.answer.trim() ? data.answer.trim() : "No answer generated.";
 
       setMessages((prev) => prev.map((m) => (m.id === thinkingId ? { ...m, text: answer } : m)));
     } catch (e: any) {
-      const msg =
-        typeof e?.message === "string" ? e.message : "Something went wrong calling /api/chat.";
-
+      const msg = typeof e?.message === "string" ? e.message : "Something went wrong calling /api/chat.";
       setMessages((prev) =>
         prev.map((m) =>
           m.id === thinkingId
@@ -148,14 +130,11 @@ export default function Page() {
     setThreadId(null);
     try {
       localStorage.removeItem(THREAD_STORAGE_KEY);
-    } catch {
-      // ignore
-    }
+    } catch {}
   }
 
   return (
     <main style={{ minHeight: "100vh", display: "flex", flexDirection: "column" }}>
-      {/* Header */}
       <header
         style={{
           padding: "14px 16px",
@@ -172,12 +151,8 @@ export default function Page() {
         }}
       >
         <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-          <div style={{ fontSize: 15, fontWeight: 700 }}>
-            MVVC · {formatAssistantLabel()}
-          </div>
-          <div style={{ fontSize: 12, opacity: 0.8 }}>
-            {threadId ? `Thread: ${threadId.slice(0, 8)}…` : "Thread: new"}
-          </div>
+          <div style={{ fontSize: 15, fontWeight: 700 }}>MVVC · {formatAssistantLabel()}</div>
+          <div style={{ fontSize: 12, opacity: 0.8 }}>{threadId ? `Thread: ${threadId.slice(0, 8)}…` : "Thread: new"}</div>
         </div>
 
         <button
@@ -198,28 +173,13 @@ export default function Page() {
         </button>
       </header>
 
-      {/* Messages */}
-      <section
-        style={{
-          flex: 1,
-          padding: "16px",
-          width: "100%",
-          maxWidth: 880,
-          margin: "0 auto",
-        }}
-      >
+      <section style={{ flex: 1, padding: "16px", width: "100%", maxWidth: 880, margin: "0 auto" }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           {messages.map((m) => {
             const isUser = m.role === "user";
 
             return (
-              <div
-                key={m.id}
-                style={{
-                  display: "flex",
-                  justifyContent: isUser ? "flex-end" : "flex-start",
-                }}
-              >
+              <div key={m.id} style={{ display: "flex", justifyContent: isUser ? "flex-end" : "flex-start" }}>
                 <div
                   style={{
                     maxWidth: "92%",
@@ -227,22 +187,35 @@ export default function Page() {
                     padding: "12px 12px",
                     borderRadius: 14,
                     border: "1px solid rgba(255,255,255,0.12)",
-                    background: isUser
-                      ? "rgba(255,255,255,0.12)"
-                      : "rgba(255,255,255,0.06)",
+                    background: isUser ? "rgba(255,255,255,0.12)" : "rgba(255,255,255,0.06)",
                     whiteSpace: "pre-wrap",
                     lineHeight: 1.35,
                     fontSize: 14,
                   }}
                 >
                   {!isUser && (
-                    <div style={{ fontSize: 12, opacity: 0.85, marginBottom: 6 }}>
-                      {formatAssistantLabel()}
-                    </div>
+                    <div style={{ fontSize: 12, opacity: 0.85, marginBottom: 6 }}>{formatAssistantLabel()}</div>
                   )}
 
-                  {/* Render Markdown so **player names** actually bold */}
-                  <ReactMarkdown>{m.text}</ReactMarkdown>
+                  {/* Render assistant messages as Markdown; user messages as plain text */}
+                  {isUser ? (
+                    m.text
+                  ) : (
+                    <ReactMarkdown
+                      components={{
+                        p: (props) => <p style={{ margin: "8px 0" }} {...props} />,
+                        ul: (props) => <ul style={{ margin: "8px 0", paddingLeft: 18 }} {...props} />,
+                        ol: (props) => <ol style={{ margin: "8px 0", paddingLeft: 18 }} {...props} />,
+                        li: (props) => <li style={{ margin: "4px 0" }} {...props} />,
+                        strong: (props) => <strong style={{ fontWeight: 800 }} {...props} />,
+                        h1: (props) => <div style={{ fontSize: 18, fontWeight: 800, margin: "10px 0 6px" }} {...props} />,
+                        h2: (props) => <div style={{ fontSize: 16, fontWeight: 800, margin: "10px 0 6px" }} {...props} />,
+                        h3: (props) => <div style={{ fontSize: 14, fontWeight: 800, margin: "10px 0 6px" }} {...props} />,
+                      }}
+                    >
+                      {m.text}
+                    </ReactMarkdown>
+                  )}
                 </div>
               </div>
             );
@@ -251,7 +224,6 @@ export default function Page() {
         </div>
       </section>
 
-      {/* Composer */}
       <footer
         style={{
           padding: "14px 16px",
@@ -260,16 +232,7 @@ export default function Page() {
           backdropFilter: "blur(8px)",
         }}
       >
-        <div
-          style={{
-            width: "100%",
-            maxWidth: 880,
-            margin: "0 auto",
-            display: "flex",
-            gap: 10,
-            alignItems: "flex-end",
-          }}
-        >
+        <div style={{ width: "100%", maxWidth: 880, margin: "0 auto", display: "flex", gap: 10, alignItems: "flex-end" }}>
           <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
