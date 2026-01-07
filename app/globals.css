@@ -18,18 +18,18 @@ body {
   background: linear-gradient(135deg, var(--bg1), var(--bg2));
 }
 
-/* ================================
-   Responsive Results Page Layout
-   ================================ */
+/* =========================================
+   Results Page – Responsive Grid (Step 5)
+   ========================================= */
 
-/* Default (mobile-first): stack cards */
+/* Mobile-first: cards stack vertically */
 .summary-grid {
   display: grid;
   grid-template-columns: 1fr;
   gap: 16px;
 }
 
-/* Tablet + Desktop: show cards side-by-side */
+/* Tablet + Desktop: cards side-by-side */
 @media (min-width: 768px) {
   .summary-grid {
     grid-template-columns: repeat(3, 1fr);
