@@ -6,7 +6,7 @@ function assertEnv(name: string) {
 }
 
 const TEAM_ID = "7d5c9d23-e78c-4b08-8869-64cece1acee5"; // MVVC 14 Black
-const DEFAULT_SEASON = "fall"; // change if you want, but code will fallback if season mismatch
+const DEFAULT_SEASON = "fall";
 
 type StatRow = {
   player_name: string;
@@ -56,7 +56,6 @@ function computeTotals(statsRows: StatRow[]) {
       t[k] = (t[k] ?? 0) + toNum(s[k]);
     }
 
-    // For weighted SR rating
     const srAtt = toNum(s["serve_receive_attempts"]);
     const srRating = toNum(s["serve_receive_passing_rating"]);
     t["_sr_attempts"] = (t["_sr_attempts"] ?? 0) + srAtt;
@@ -65,7 +64,7 @@ function computeTotals(statsRows: StatRow[]) {
 
   const out: Array<{ player: string; totals: Record<string, number> }> = [];
 
-  // ✅ FIX: convert iterator to array for older TS targets
+  // Convert iterator to array (avoids TS downlevelIteration issues)
   for (const [player, t] of Array.from(totals.entries())) {
     const srAtt = t["_sr_attempts"] ?? 0;
     const srSum = t["_sr_rating_sum"] ?? 0;
@@ -110,7 +109,6 @@ async function retrieveContext(teamId: string, season: string, question: string)
     .textSearch("tsv", cleaned, { type: "websearch" })
     .limit(6);
 
-  // Don’t hard fail if search has no matches / errors
   const safeSearchChunks = e1 ? [] : searchChunks ?? [];
 
   // Merge + dedupe
@@ -125,17 +123,16 @@ async function retrieveContext(teamId: string, season: string, question: string)
     .select("match_date,tournament,opponent,result,score,round,sets_won,sets_lost,set_diff")
     .eq("team_id", teamId)
     .order("match_date", { ascending: true })
-    .limit(500);
+    .limit(1000);
   if (em) throw em;
 
-  // D) Player stats (try season filter, fallback to no-season if 0 rows)
+  // D) Player stats (season filter; fallback to all if empty)
   let { data: statsRows, error: es } = await supabase
     .from("player_game_stats")
     .select("player_name,position,game_date,opponent,stats")
     .eq("team_id", teamId)
     .eq("season", season)
     .limit(5000);
-
   if (es) throw es;
 
   if (!statsRows || statsRows.length === 0) {
@@ -186,7 +183,6 @@ function prettyContext(chunks: any[], matches: any[], statsRows: StatRow[]) {
     const killsTop = topN(computed, "attack_kills", 8);
     const digsTop = topN(computed, "digs_successful", 8);
     const acesTop = topN(computed, "serve_aces", 8);
-    const seTop = topN(computed, "serve_errors", 8);
 
     parts.push("Top kills (attack_kills):");
     killsTop.forEach((x, i) => parts.push(`- ${i + 1}. ${x.player}: ${x.value}`));
@@ -196,9 +192,6 @@ function prettyContext(chunks: any[], matches: any[], statsRows: StatRow[]) {
 
     parts.push("\nTop aces (serve_aces):");
     acesTop.forEach((x, i) => parts.push(`- ${i + 1}. ${x.player}: ${x.value}`));
-
-    parts.push("\nMost serve errors (serve_errors):");
-    seTop.forEach((x, i) => parts.push(`- ${i + 1}. ${x.player}: ${x.value}`));
 
     const sr = computed
       .map((x) => ({
@@ -221,6 +214,35 @@ function prettyContext(chunks: any[], matches: any[], statsRows: StatRow[]) {
   return parts.join("\n");
 }
 
+// Robust text extractor for Responses API
+function extractResponseText(json: any): string {
+  // 1) Most reliable: convenience string
+  if (typeof json?.output_text === "string" && json.output_text.trim()) {
+    return json.output_text.trim();
+  }
+
+  // 2) Walk output structure
+  let text = "";
+
+  const out = json?.output ?? [];
+  for (const item of out) {
+    // Sometimes item itself is output_text
+    if (item?.type === "output_text" && typeof item?.text === "string") {
+      text += item.text;
+      continue;
+    }
+
+    // Common case: message with content array
+    const content = item?.content ?? [];
+    for (const c of content) {
+      if (c?.type === "output_text" && typeof c?.text === "string") text += c.text;
+      if (c?.type === "refusal" && typeof c?.refusal === "string") text += c.refusal;
+    }
+  }
+
+  return (text || "").trim();
+}
+
 async function callOpenAI(question: string, context: string) {
   assertEnv("OPENAI_API_KEY");
   const model = process.env.OPENAI_MODEL ?? "gpt-5-mini";
@@ -233,7 +255,7 @@ async function callOpenAI(question: string, context: string) {
     },
     body: JSON.stringify({
       model,
-      max_output_tokens: 700,
+      max_output_tokens: 900,
       input: [
         {
           role: "system",
@@ -271,17 +293,10 @@ Rules:
   }
 
   const json = await res.json();
-  const out = json.output ?? [];
-  let text = "";
+  const text = extractResponseText(json);
 
-  for (const item of out) {
-    const content = item.content ?? [];
-    for (const c of content) {
-      if (c.type === "output_text" && typeof c.text === "string") text += c.text;
-    }
-  }
-
-  return (text || "").trim() || "No answer generated.";
+  // Never return blank to UI
+  return text || "I couldn’t generate an answer from the current context. Try rephrasing the question or ask for a specific stat (kills, digs, aces, passing rating, win/loss).";
 }
 
 export async function POST(req: Request) {
