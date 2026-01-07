@@ -20,9 +20,6 @@ function toNum(v: any): number {
 }
 
 function parseStats(raw: any): Record<string, any> {
-  // In your table, stats may arrive as:
-  // 1) an object (ideal), OR
-  // 2) a string containing JSON (your sample row shows this)
   if (!raw) return {};
   if (typeof raw === "object") return raw;
   if (typeof raw === "string") {
@@ -42,9 +39,8 @@ type PlayerTotals = {
   digs: number;
   aces: number;
   serveErrors: number;
-
   srAttempts: number;
-  srRatingSum: number; // rating * attempts (weighted)
+  srRatingSum: number; // rating * attempts
 };
 
 function computePlayerTotals(statsRows: any[]) {
@@ -61,19 +57,19 @@ function computePlayerTotals(statsRows: any[]) {
     const aces = toNum(s.serve_aces);
     const serveErrors = toNum(s.serve_errors);
 
-    // Weighted SR rating (0–3): use rating * attempts if we can
     const srAttempts = toNum(s.serve_receive_attempts);
     const srRating = toNum(s.serve_receive_passing_rating);
     const srRatingSum = srAttempts > 0 ? srRating * srAttempts : 0;
 
-    const prev = totals.get(player) ?? {
-      kills: 0,
-      digs: 0,
-      aces: 0,
-      serveErrors: 0,
-      srAttempts: 0,
-      srRatingSum: 0,
-    };
+    const prev =
+      totals.get(player) ?? ({
+        kills: 0,
+        digs: 0,
+        aces: 0,
+        serveErrors: 0,
+        srAttempts: 0,
+        srRatingSum: 0,
+      } as PlayerTotals);
 
     prev.kills += kills;
     prev.digs += digs;
@@ -85,7 +81,6 @@ function computePlayerTotals(statsRows: any[]) {
     totals.set(player, prev);
   }
 
-  // Convert to array with computed SR rating
   const out: Array<{
     player: string;
     kills: number;
@@ -96,11 +91,8 @@ function computePlayerTotals(statsRows: any[]) {
     srRating: number | null;
   }> = [];
 
-  for (const entry of Array.from(totals.entries())) {
-    const player = entry[0];
-    const t = entry[1];
+  for (const [player, t] of Array.from(totals.entries())) {
     const srRating = t.srAttempts > 0 ? t.srRatingSum / t.srAttempts : null;
-
     out.push({
       player,
       kills: t.kills,
@@ -123,61 +115,41 @@ function safeOpponentName(x: any) {
   return String(x ?? "").trim();
 }
 
-/** Data retrieval */
 async function retrieveData(teamId: string, season: "fall" | "spring" | "summer") {
   const supabase = supabaseService();
 
-  // A) Roster/notes chunks (optional)
-  const { data: rosterChunks } = await supabase
-    .from("knowledge_chunks")
-    .select("id,title,content,tags")
-    .eq("team_id", teamId)
-    .contains("tags", ["roster"])
-    .limit(5);
-
-  // B) Match results (for win/loss + “trouble opponents”)
   const { data: matches, error: em } = await supabase
     .from("match_results")
     .select("match_date,tournament,opponent,result,score,round,sets_won,sets_lost,set_diff")
     .eq("team_id", teamId)
     .order("match_date", { ascending: true })
-    .limit(1000);
+    .limit(5000);
   if (em) throw em;
 
-  // C) Player game stats for the chosen season
   const { data: statsRows, error: es } = await supabase
     .from("player_game_stats")
     .select("player_name,position,game_date,opponent,stats,season")
     .eq("team_id", teamId)
     .eq("season", season)
     .order("game_date", { ascending: false })
-    .limit(2000);
+    .limit(5000);
   if (es) throw es;
 
-  return {
-    rosterChunks: rosterChunks ?? [],
-    matches: matches ?? [],
-    statsRows: statsRows ?? [],
-  };
+  return { matches: matches ?? [], statsRows: statsRows ?? [] };
 }
 
-/** Compute match summaries */
 function computeWinLoss(matches: any[]) {
   let wins = 0;
   let losses = 0;
-
   for (const m of matches) {
     const r = String(m.result ?? "").toLowerCase();
-    // supports values like "Won", "Lost", "W", "L"
     if (r.includes("won") || r === "w") wins++;
-    if (r.includes("lost") || r === "l") losses++;
+    else if (r.includes("lost") || r === "l") losses++;
   }
-
   return { wins, losses, total: wins + losses };
 }
 
 function computeTroubleOpponents(matches: any[]) {
-  // “Most trouble” = most losses vs that opponent, then worst set_diff
   const map = new Map<string, { losses: number; matches: number; setDiff: number }>();
 
   for (const m of matches) {
@@ -204,76 +176,64 @@ function computeTroubleOpponents(matches: any[]) {
 
   arr.sort((a, b) => {
     if (b.losses !== a.losses) return b.losses - a.losses;
-    return a.setDiff - b.setDiff; // more negative is worse
+    return a.setDiff - b.setDiff; // more negative = worse
   });
 
   return arr.slice(0, 8);
 }
 
-/** Build a clean “Facts vs Coaching Insight” response */
-function buildFactsBlock(opts: {
-  wins: number;
-  losses: number;
-  season: string;
-  leaders: ReturnType<typeof computePlayerTotals>;
-  trouble: ReturnType<typeof computeTroubleOpponents>;
-}) {
-  const { wins, losses, season, leaders, trouble } = opts;
+/** Detect common question intents so we can answer directly */
+function detectIntent(q: string) {
+  const s = q.toLowerCase();
+  const isPasser =
+    s.includes("passer rating") ||
+    s.includes("passing rating") ||
+    s.includes("serve receive") ||
+    s.includes("serve-receive") ||
+    s.includes("sr rating") ||
+    s.includes("best passer");
 
-  const killsLeader = topN(leaders, 1, (x) => x.kills)[0];
-  const digsLeader = topN(leaders, 1, (x) => x.digs)[0];
-  const acesLeader = topN(leaders, 1, (x) => x.aces)[0];
+  const isWinLoss =
+    s.includes("win loss") || s.includes("win-loss") || s.includes("record") || s.includes("w-l");
 
-  const srCandidates = leaders.filter((x) => (x.srAttempts ?? 0) >= 10 && x.srRating !== null);
-  const srLeader = topN(srCandidates, 1, (x) => x.srRating ?? 0)[0];
+  const isKillsLeader =
+    s.includes("leads") && s.includes("kills") ||
+    s.includes("most kills") ||
+    s.includes("kills leader");
 
+  const isTroubleOpp =
+    s.includes("most trouble") ||
+    s.includes("hardest opponent") ||
+    s.includes("toughest opponent") ||
+    s.includes("which opponents");
+
+  return { isPasser, isWinLoss, isKillsLeader, isTroubleOpp };
+}
+
+function formatAnswer(opts: { facts: string[]; insight?: string[] }) {
   const lines: string[] = [];
   lines.push(`Data-Backed (Facts)`);
   lines.push(`-------------------`);
-  lines.push(`Season in stats table: ${season}`);
-  lines.push(`Win/Loss (from match_results): ${wins}-${losses}`);
+  lines.push(...opts.facts);
 
   lines.push(``);
-  lines.push(`__Team Leaders (season totals)__`);
-  if (killsLeader) lines.push(`• **${killsLeader.player}** — ${killsLeader.kills} kills`);
-  if (digsLeader) lines.push(`• **${digsLeader.player}** — ${digsLeader.digs} digs`);
-  if (acesLeader) lines.push(`• **${acesLeader.player}** — ${acesLeader.aces} aces`);
-  if (srLeader)
-    lines.push(
-      `• **${srLeader.player}** — best serve-receive rating: ${srLeader.srRating!.toFixed(2)} (0–3 scale) on ${srLeader.srAttempts} attempts`
-    );
-  else lines.push(`• Serve-receive leader: not enough SR attempts found to rank confidently (need ≥10 attempts).`);
-
-  lines.push(``);
-  lines.push(`__Opponents That Caused the Most Trouble__`);
-  if (trouble.length === 0) {
-    lines.push(`• Not enough match_results rows to rank opponents.`);
-  } else {
-    for (const t of trouble.slice(0, 5)) {
-      lines.push(`• **${t.opponent}** — losses: ${t.losses}/${t.matches}, set diff: ${t.setDiff}`);
-    }
-  }
+  lines.push(`Coaching Insight (Inference)`);
+  lines.push(`----------------------------`);
+  if (opts.insight && opts.insight.length) lines.push(...opts.insight);
+  else lines.push(`• Ask a follow-up angle (rotation, matchups, serve/receive, opponents) and I’ll tailor recommendations.`);
 
   return lines.join("\n");
 }
 
-/** OpenAI (optional narrative polish) */
+/** Optional OpenAI narrative polish (kept, but NOT required for an answer) */
 async function callOpenAI(prompt: string) {
   assertEnv("OPENAI_API_KEY");
   const model = process.env.OPENAI_MODEL ?? "gpt-5-mini";
 
-  // Use SIMPLE string input to avoid content-type schema errors.
   const res = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      max_output_tokens: 700,
-      input: prompt,
-    }),
+    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model, max_output_tokens: 700, input: prompt }),
   });
 
   if (!res.ok) {
@@ -282,11 +242,8 @@ async function callOpenAI(prompt: string) {
   }
 
   const json: any = await res.json();
-
-  // Prefer convenience field if present
   if (typeof json.output_text === "string" && json.output_text.trim()) return json.output_text.trim();
 
-  // Fallback parse
   const out = json.output ?? [];
   let text = "";
   for (const item of out) {
@@ -308,46 +265,131 @@ export async function POST(req: Request) {
     const season = DEFAULT_SEASON;
 
     const { matches, statsRows } = await retrieveData(teamId, season);
-
-    // Compute facts deterministically (no “empty context” issues)
     const { wins, losses } = computeWinLoss(matches);
     const leaders = computePlayerTotals(statsRows);
     const trouble = computeTroubleOpponents(matches);
 
-    const factsBlock = buildFactsBlock({
-      wins,
-      losses,
-      season,
-      leaders,
-      trouble,
-    });
+    const intent = detectIntent(question);
 
-    // If question is very specific stats, answer directly from computed facts where possible
-    // Otherwise, let OpenAI produce a nicer narrative but ALWAYS include Facts vs Coaching Insight.
+    // Precompute leader candidates
+    const killsLeader = topN(leaders, 1, (x) => x.kills)[0];
+    const srCandidates = leaders.filter((x) => (x.srAttempts ?? 0) >= 10 && x.srRating !== null);
+    const srLeader = topN(srCandidates, 1, (x) => x.srRating ?? 0)[0];
+
+    // ✅ DIRECT ANSWERS FIRST
+    if (intent.isPasser) {
+      if (!srLeader) {
+        const answer = formatAnswer({
+          facts: [
+            `Short answer: Insufficient data in the current dataset to rank passer rating (need serve_receive_attempts and serve_receive_passing_rating).`,
+            ``,
+            `__What I looked for__`,
+            `• serve_receive_passing_rating (0–3 scale) weighted by serve_receive_attempts`,
+          ],
+          insight: [`• If your CSV has SR rating counts (0/1/2/3), we can also validate the rating calculation per player.`],
+        });
+        return NextResponse.json({ answer });
+      }
+
+      const answer = formatAnswer({
+        facts: [
+          `Short answer: **${srLeader.player}** has the best passer (serve-receive) rating — ${srLeader.srRating!.toFixed(
+            2
+          )} on ${srLeader.srAttempts} attempts (0–3 scale).`,
+          ``,
+          `__Supporting context__`,
+          `• Season: ${season}`,
+          `• Win/Loss (from match_results): ${wins}-${losses}`,
+        ],
+        insight: [
+          `• Treat **${srLeader.player}** as a primary serve-receive anchor. If you want, I can also list the top 5 passers and their attempt counts (confidence).`,
+        ],
+      });
+
+      return NextResponse.json({ answer });
+    }
+
+    if (intent.isWinLoss) {
+      const answer = formatAnswer({
+        facts: [
+          `Short answer: Win/Loss record is ${wins}-${losses} (from match_results).`,
+          ``,
+          `__Notes__`,
+          `• If you want “by tournament” records, I can break it down if tournament names are populated consistently.`,
+        ],
+        insight: [`• If you share your season goals (e.g., gold bracket finishes), I can summarize progress vs goal.`],
+      });
+      return NextResponse.json({ answer });
+    }
+
+    if (intent.isKillsLeader) {
+      if (!killsLeader) {
+        const answer = formatAnswer({
+          facts: [`Short answer: Insufficient data in the current dataset to identify a kills leader.`],
+          insight: [`• Make sure player_game_stats has attack_kills per player per match (it looks like it does—so this likely means season filter mismatch).`],
+        });
+        return NextResponse.json({ answer });
+      }
+
+      const answer = formatAnswer({
+        facts: [
+          `Short answer: **${killsLeader.player}** leads the team in kills — ${killsLeader.kills}.`,
+          ``,
+          `__Supporting context__`,
+          `• Season: ${season}`,
+        ],
+        insight: [`• If you want “kills per set” or “kills vs errors efficiency,” we can compute that too (if attempts/errors are present).`],
+      });
+      return NextResponse.json({ answer });
+    }
+
+    if (intent.isTroubleOpp) {
+      const top = trouble.slice(0, 5);
+      const answer = formatAnswer({
+        facts: [
+          `Short answer: These opponents caused the most trouble (by losses, then set differential):`,
+          ``,
+          `__Opponents__`,
+          ...top.map((t) => `• **${t.opponent}** — losses: ${t.losses}/${t.matches}, set diff: ${t.setDiff}`),
+        ],
+        insight: [`• If you tell me what “trouble” means for you (tight sets vs blowouts vs serve-receive breakdown), I can re-rank using that definition.`],
+      });
+      return NextResponse.json({ answer });
+    }
+
+    // Otherwise: use OpenAI for narrative, but keep it grounded in computed facts
+    const factsSummary = [
+      `Season: ${season}`,
+      `Win/Loss: ${wins}-${losses}`,
+      srLeader ? `Best SR rating: ${srLeader.player} ${srLeader.srRating!.toFixed(2)} on ${srLeader.srAttempts} att` : `Best SR rating: (not enough data)`,
+      killsLeader ? `Kills leader: ${killsLeader.player} ${killsLeader.kills}` : `Kills leader: (not enough data)`,
+    ].join("\n");
+
     const prompt = `
 You are the MVVC volleyball Coaching Assistant.
-Write coach-friendly answers with good spacing and clear sections.
 
-Formatting rules:
-- Use EXACT section headers:
-  Data-Backed (Facts)
-  -------------------
-  Coaching Insight (Inference)
-  ----------------------------
-- Underline sub-sections like "__Title__" (double underscores) and keep lists as bullets.
-- Make player names subtly stand out by using **Name**.
-- Do NOT include citation codes like S3/K2.
+Write a coach-friendly response with great spacing.
+Format exactly:
 
-You MUST:
-- Keep the "Data-Backed (Facts)" section strictly grounded in the provided facts block.
-- Put any recommendations, hypotheses, lineup suggestions, and training ideas in "Coaching Insight (Inference)".
+Data-Backed (Facts)
+-------------------
+<answer the user question directly, then bullets>
 
-Facts block:
-${factsBlock}
+Coaching Insight (Inference)
+----------------------------
+<recommendations based on the facts>
 
-User question:
+Rules:
+- Player names should be bold like **Name**.
+- Do not include citations or codes.
+- Facts must come ONLY from the facts block below.
+
+FACTS BLOCK:
+${factsSummary}
+
+USER QUESTION:
 ${question}
-`;
+`.trim();
 
     let aiText = "";
     try {
@@ -356,11 +398,18 @@ ${question}
       aiText = "";
     }
 
-    // Hard fallback: never return "No answer generated"
     if (!aiText) {
-      aiText =
-        factsBlock +
-        `\n\nCoaching Insight (Inference)\n----------------------------\n• I can answer this more deeply if you ask a specific angle (lineup, serve-receive, hitting efficiency, opponent breakdown, etc.).`;
+      // Fallback: never "No answer generated"
+      const answer = formatAnswer({
+        facts: [
+          `Short answer: I can’t generate a narrative answer right now, but your data is loaded.`,
+          ``,
+          `__Available facts__`,
+          `• ${factsSummary.replace(/\n/g, "\n• ")}`,
+        ],
+        insight: [`• Ask something like “top 5 passers”, “kills vs errors efficiency”, or “break down record by tournament”.`],
+      });
+      return NextResponse.json({ answer });
     }
 
     return NextResponse.json({ answer: aiText });
