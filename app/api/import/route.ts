@@ -3,13 +3,9 @@ import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
-// Simple CSV parser (plain CSV; no commas inside quoted fields).
+// Very simple CSV parser (OK for plain CSV without quoted commas)
 function csvToRows(text: string) {
-  const lines = text
-    .replace(/^\uFEFF/, "") // strip BOM if present
-    .split(/\r?\n/)
-    .filter((l) => l.trim().length > 0);
-
+  const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
   if (lines.length < 2) return [];
 
   const header = lines[0].split(",").map((s) => s.trim());
@@ -22,6 +18,22 @@ function csvToRows(text: string) {
     rows.push(obj);
   }
   return rows;
+}
+
+function assertEnv(name: string) {
+  if (!process.env[name]) throw new Error(`Missing env var: ${name}`);
+}
+
+function toInt(v: any) {
+  const n = Number(String(v ?? "").trim());
+  return Number.isFinite(n) ? n : null;
+}
+
+function toDateISO(v: any) {
+  const s = String(v ?? "").trim();
+  if (!s) return null;
+  // expecting YYYY-MM-DD in your master file
+  return s;
 }
 
 export async function GET() {
@@ -38,69 +50,93 @@ export async function POST(req: Request) {
     }
 
     const teamId = String(form.get("teamId") ?? "").trim();
-    const season = String(form.get("season") ?? "").trim() as "fall" | "spring" | "summer";
+    const season = String(form.get("season") ?? "").trim() as "fall" | "spring" | "summer"; // still used for player stats imports
     const file = form.get("file");
 
     if (!teamId) return NextResponse.json({ error: "teamId required" }, { status: 400 });
-    if (!season) return NextResponse.json({ error: "season required" }, { status: 400 });
     if (!(file instanceof File)) return NextResponse.json({ error: "file required" }, { status: 400 });
 
-    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-    const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-    if (!supabaseUrl) return NextResponse.json({ error: "Missing NEXT_PUBLIC_SUPABASE_URL" }, { status: 500 });
-    if (!serviceKey) return NextResponse.json({ error: "Missing SUPABASE_SERVICE_ROLE_KEY" }, { status: 500 });
+    assertEnv("NEXT_PUBLIC_SUPABASE_URL");
+    assertEnv("SUPABASE_SERVICE_ROLE_KEY");
 
-    const supabase = createClient(supabaseUrl, serviceKey);
+    const supabase = createClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!
+    );
 
     const text = await file.text();
     const rows = csvToRows(text);
 
     if (rows.length === 0) {
-      return NextResponse.json({ error: "CSV parsed 0 data rows" }, { status: 400 });
+      return NextResponse.json({ error: "CSV parsed 0 data rows (check headers / formatting)" }, { status: 400 });
     }
 
-    let rowsInserted = 0;
-    let rowsSkippedNoName = 0;
+    // Detect which kind of CSV this is by looking at headers
+    const first = rows[0] ?? {};
+    const keys = new Set(Object.keys(first));
 
-    for (const r of rows) {
-      // ✅ Support your CURRENT CSV headers first
-      // Current: player_name, match_date, opponent, position, source_file, sets_played
-      // Older: Name/Player, GameDate, Opponent, Position, SourceFile
-      const playerName = String(r["player_name"] ?? r["Name"] ?? r["Player"] ?? "").trim();
-      if (!playerName) {
-        rowsSkippedNoName++;
-        continue;
+    const isMatchResults =
+      keys.has("match_date") &&
+      keys.has("opponent") &&
+      keys.has("result") &&
+      (keys.has("tournament") || keys.has("score"));
+
+    // =========================
+    // A) MATCH RESULTS IMPORT
+    // =========================
+    if (isMatchResults) {
+      let inserted = 0;
+
+      for (const r of rows) {
+        const match_date = toDateISO(r["match_date"]);
+        const opponent = String(r["opponent"] ?? "").trim();
+        const result = String(r["result"] ?? "").trim();
+
+        if (!opponent || (result !== "W" && result !== "L")) continue;
+
+        const payload = {
+          team_id: teamId,
+          match_date,
+          tournament: String(r["tournament"] ?? "").trim() || null,
+          round: String(r["round"] ?? "").trim() || null,
+          opponent,
+          result,
+          score: String(r["score"] ?? "").trim() || null,
+
+          sets_won: toInt(r["sets_won"]),
+          sets_lost: toInt(r["sets_lost"]),
+          set_diff: toInt(r["set_diff"]),
+
+          match_win: toInt(r["match_win"]),
+          match_loss: toInt(r["match_loss"]),
+        };
+
+        const { error } = await supabase.from("match_results").insert(payload);
+        if (error) return NextResponse.json({ error: `Supabase insert failed: ${error.message}` }, { status: 500 });
+
+        inserted++;
       }
 
-      const gameDate = String(r["match_date"] ?? r["GameDate"] ?? "").trim() || null;
-      const opponent = String(r["opponent"] ?? r["Opponent"] ?? "").trim() || null;
-      const position = String(r["position"] ?? r["Position"] ?? "").trim() || null;
-      const setsPlayedRaw = String(r["sets_played"] ?? r["SetsPlayed"] ?? "").trim();
-      const setsPlayed = setsPlayedRaw !== "" && Number.isFinite(Number(setsPlayedRaw)) ? Number(setsPlayedRaw) : null;
+      return NextResponse.json({ ok: true, type: "match_results", rowsParsed: rows.length, rowsInserted: inserted });
+    }
 
-      const sourceFile =
-        String(r["source_file"] ?? r["SourceFile"] ?? "").trim() || (file.name ?? null);
+    // =========================
+    // B) PLAYER GAME STATS IMPORT (existing behavior)
+    // =========================
+    if (!season) return NextResponse.json({ error: "season required for player stats import" }, { status: 400 });
 
-      // Remove identity columns from stats payload so stats is "just stats"
-      const {
-        player_name,
-        match_date,
-        opponent: opp2,
-        position: pos2,
-        source_file,
-        sets_played,
-        Name,
-        Player,
-        GameDate,
-        Opponent,
-        Position,
-        SourceFile,
-        SetsPlayed,
-        ...rest
-      } = r;
+    let rowsInserted = 0;
 
-      // Put sets_played into stats too (handy for per-set questions) if present
-      if (setsPlayed !== null) rest["sets_played"] = setsPlayed;
+    for (const r of rows) {
+      const playerName = (r["Name"] || r["Player"] || r["player_name"] || "").trim();
+      if (!playerName) continue;
+
+      const gameDate = (r["GameDate"] || r["game_date"] || r["match_date"] || "").trim() || null;
+      const opponent = (r["Opponent"] || r["opponent"] || "").trim() || null;
+      const sourceFile = (r["SourceFile"] || r["source_file"] || "").trim() || (file.name ?? null);
+      const position = (r["Position"] || r["position"] || "").trim() || null;
+
+      const { Name, Player, GameDate, Opponent, SourceFile, Position, ...rest } = r;
 
       const { error } = await supabase.from("player_game_stats").insert({
         team_id: teamId,
@@ -113,19 +149,12 @@ export async function POST(req: Request) {
         stats: rest,
       });
 
-      if (error) {
-        return NextResponse.json({ error: `Supabase insert failed: ${error.message}` }, { status: 500 });
-      }
+      if (error) return NextResponse.json({ error: `Supabase insert failed: ${error.message}` }, { status: 500 });
 
       rowsInserted++;
     }
 
-    return NextResponse.json({
-      ok: true,
-      rowsParsed: rows.length,
-      rowsInserted,
-      rowsSkippedNoName,
-    });
+    return NextResponse.json({ ok: true, type: "player_game_stats", rowsParsed: rows.length, rowsInserted });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message ?? String(e) }, { status: 500 });
   }
