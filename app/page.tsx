@@ -2,6 +2,7 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 type Role = "user" | "assistant";
 type Message = { id: string; role: Role; text: string };
@@ -12,7 +13,7 @@ function uid() {
 
 const ASSISTANT_NAME = "MVVC Analyst";
 const TEAM_NAME = "MVVC 14 Black";
-const LOGO_SRC = "/mvvc-logo.png"; // put logo in /public
+const LOGO_SRC = "/mvvc-logo.png"; // put logo in /public/mvvc-logo.png
 
 export default function Page() {
   const [messages, setMessages] = useState<Message[]>([
@@ -31,7 +32,6 @@ export default function Page() {
 
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
-
   const bottomRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -65,9 +65,7 @@ export default function Page() {
       setMessages((prev) => prev.map((m) => (m.id === thinkingId ? { ...m, text: answer } : m)));
     } catch (e: any) {
       const msg = typeof e?.message === "string" ? e.message : "Unknown error.";
-      setMessages((prev) =>
-        prev.map((m) => (m.id === thinkingId ? { ...m, text: `**Error:** ${msg}` } : m))
-      );
+      setMessages((prev) => prev.map((m) => (m.id === thinkingId ? { ...m, text: `**Error:** ${msg}` } : m)));
     } finally {
       setIsSending(false);
     }
@@ -81,25 +79,11 @@ export default function Page() {
   }
 
   function clearChat() {
-    setMessages([
-      {
-        id: uid(),
-        role: "assistant",
-        text: `New chat started. Try **team roster** or **show every game result**.`,
-      },
-    ]);
+    setMessages([{ id: uid(), role: "assistant", text: `New chat started. Try **team roster** or **show every game result**.` }]);
   }
 
   return (
-    <main
-      style={{
-        minHeight: "100vh",
-        background: "#f6f7fb",
-        color: "#0f172a",
-        display: "flex",
-        flexDirection: "column",
-      }}
-    >
+    <main style={{ minHeight: "100vh", background: "#f6f7fb", color: "#0f172a", display: "flex", flexDirection: "column" }}>
       <header
         style={{
           position: "sticky",
@@ -110,17 +94,7 @@ export default function Page() {
           borderBottom: "1px solid rgba(15,23,42,0.08)",
         }}
       >
-        <div
-          style={{
-            maxWidth: 1040,
-            margin: "0 auto",
-            padding: "14px 16px",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: 12,
-          }}
-        >
+        <div style={{ maxWidth: 1040, margin: "0 auto", padding: "14px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
             <div
               style={{
@@ -191,17 +165,7 @@ export default function Page() {
                   >
                     {!isUser && (
                       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-                        <div
-                          style={{
-                            width: 22,
-                            height: 22,
-                            borderRadius: 8,
-                            overflow: "hidden",
-                            border: "1px solid rgba(15,23,42,0.10)",
-                            background: "rgba(15,23,42,0.03)",
-                            flexShrink: 0,
-                          }}
-                        >
+                        <div style={{ width: 22, height: 22, borderRadius: 8, overflow: "hidden", border: "1px solid rgba(15,23,42,0.10)", background: "rgba(15,23,42,0.03)", flexShrink: 0 }}>
                           <img src={LOGO_SRC} alt="MVVC" style={{ width: "100%", height: "100%", objectFit: "contain" }} />
                         </div>
                         <div style={{ fontSize: 12, fontWeight: 900, color: "rgba(15,23,42,0.70)" }}>{ASSISTANT_NAME}</div>
@@ -209,13 +173,10 @@ export default function Page() {
                     )}
 
                     <ReactMarkdown
+                      remarkPlugins={[remarkGfm]}
                       components={{
-                        h2: ({ children }) => (
-                          <h2 style={{ fontSize: 16, fontWeight: 950, margin: "12px 0 8px 0" }}>{children}</h2>
-                        ),
-                        h3: ({ children }) => (
-                          <h3 style={{ fontSize: 14, fontWeight: 950, margin: "12px 0 6px 0" }}>{children}</h3>
-                        ),
+                        h2: ({ children }) => <h2 style={{ fontSize: 16, fontWeight: 950, margin: "12px 0 8px 0" }}>{children}</h2>,
+                        h3: ({ children }) => <h3 style={{ fontSize: 14, fontWeight: 950, margin: "12px 0 6px 0" }}>{children}</h3>,
                         p: ({ children }) => <p style={{ margin: "0 0 10px 0" }}>{children}</p>,
                         ul: ({ children }) => <ul style={{ margin: "8px 0 10px 18px" }}>{children}</ul>,
                         ol: ({ children }) => <ol style={{ margin: "8px 0 10px 18px" }}>{children}</ol>,
@@ -223,12 +184,9 @@ export default function Page() {
                         strong: ({ children }) => <strong style={{ fontWeight: 950 }}>{children}</strong>,
                         table: ({ children }) => (
                           <div style={{ overflowX: "auto", margin: "10px 0 12px 0" }}>
-                            <table style={{ width: "100%", borderCollapse: "separate", borderSpacing: 0, fontSize: 13 }}>
-                              {children}
-                            </table>
+                            <table style={{ width: "100%", borderCollapse: "separate", borderSpacing: 0, fontSize: 13 }}>{children}</table>
                           </div>
                         ),
-                        thead: ({ children }) => <thead>{children}</thead>,
                         th: ({ children }) => (
                           <th
                             style={{
@@ -245,28 +203,7 @@ export default function Page() {
                           </th>
                         ),
                         td: ({ children }) => (
-                          <td
-                            style={{
-                              padding: "10px 10px",
-                              borderBottom: "1px solid rgba(15,23,42,0.08)",
-                              verticalAlign: "top",
-                            }}
-                          >
-                            {children}
-                          </td>
-                        ),
-                        code: ({ children }) => (
-                          <code
-                            style={{
-                              background: "rgba(15,23,42,0.06)",
-                              border: "1px solid rgba(15,23,42,0.10)",
-                              borderRadius: 8,
-                              padding: "2px 6px",
-                              fontSize: 13,
-                            }}
-                          >
-                            {children}
-                          </code>
+                          <td style={{ padding: "10px 10px", borderBottom: "1px solid rgba(15,23,42,0.08)", verticalAlign: "top" }}>{children}</td>
                         ),
                       }}
                     >
