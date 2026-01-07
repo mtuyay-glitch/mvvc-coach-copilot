@@ -83,10 +83,48 @@ function computeAggregates(matches: MatchRow[], statsRows: StatRow[]) {
   let wins = 0;
   let losses = 0;
 
+  // Opponent rollups (for "record vs opponent" / "what changed in losses")
+  const vsOpponent: Record<
+    string,
+    {
+      matches: number;
+      wins: number;
+      losses: number;
+      setDiff: number;
+      lastDate: string;
+      lastScore: string;
+      lastTournament: string;
+    }
+  > = {};
+
   for (const m of matches) {
     const wl = normalizeWinLoss(m.result);
     if (wl === "W") wins++;
     if (wl === "L") losses++;
+
+    const opp = (m.opponent ?? "Unknown Opponent").trim() || "Unknown Opponent";
+    const iso = safeIso(m.match_date);
+    if (!vsOpponent[opp]) {
+      vsOpponent[opp] = {
+        matches: 0,
+        wins: 0,
+        losses: 0,
+        setDiff: 0,
+        lastDate: "",
+        lastScore: "",
+        lastTournament: "",
+      };
+    }
+    vsOpponent[opp].matches += 1;
+    if (wl === "W") vsOpponent[opp].wins += 1;
+    if (wl === "L") vsOpponent[opp].losses += 1;
+    vsOpponent[opp].setDiff += toNum(m.set_diff);
+
+    if (iso && (!vsOpponent[opp].lastDate || iso > vsOpponent[opp].lastDate)) {
+      vsOpponent[opp].lastDate = iso;
+      vsOpponent[opp].lastScore = (m.score ?? "").trim();
+      vsOpponent[opp].lastTournament = (m.tournament ?? "").trim();
+    }
   }
 
   const byPlayer: Record<string, PlayerAgg> = {};
@@ -122,6 +160,7 @@ function computeAggregates(matches: MatchRow[], statsRows: StatRow[]) {
       }
     }
 
+    // SR weighted rating (0–3)
     const srAtt = toNum(stats.serve_receive_attempts);
     const srRating = toNum(stats.serve_receive_passing_rating);
     if (srAtt > 0) {
@@ -149,6 +188,21 @@ function computeAggregates(matches: MatchRow[], statsRows: StatRow[]) {
   const positions: Record<string, string | null> = {};
   for (const p of Object.keys(byPlayer)) positions[p] = byPlayer[p].position ?? null;
 
+  const vsOpponentRows = Object.keys(vsOpponent)
+    .map((opp) => ({
+      opponent: opp,
+      matches: vsOpponent[opp].matches,
+      wins: vsOpponent[opp].wins,
+      losses: vsOpponent[opp].losses,
+      setDiff: vsOpponent[opp].setDiff,
+      lastDate: vsOpponent[opp].lastDate,
+      lastScore: vsOpponent[opp].lastScore,
+      lastTournament: vsOpponent[opp].lastTournament,
+    }))
+    .sort((a, b) => b.losses - a.losses || a.setDiff - b.setDiff);
+
+  const troubleOpponents = vsOpponentRows.filter((r) => r.losses > 0).slice(0, 10);
+
   return {
     wins,
     losses,
@@ -158,6 +212,8 @@ function computeAggregates(matches: MatchRow[], statsRows: StatRow[]) {
     availableStatKeys: Array.from(statKeySet.values()).sort(),
     teamServeReceive: teamSrAttempts > 0 ? { scale: "0-3", rating: Number(teamSrRating.toFixed(2)), attempts: teamSrAttempts } : null,
     teamByMonth,
+    vsOpponentRows,
+    troubleOpponents,
     hasMatches: matches.length > 0,
     hasStats: Object.keys(byPlayer).length > 0,
   };
@@ -279,24 +335,34 @@ async function callOpenAI(question: string, factsPayload: any) {
 You are "${PERSONA}" for MVVC 14 Black boys volleyball.
 
 Critical: Your output must be BEAUTIFUL and easy to read.
+
 Formatting rules:
 - Use Markdown with spacing.
 - Use headings (##) and short sections.
-- Prefer tables for roster and leaderboards.
+- Prefer tables for roster, leaderboards, opponent records, and match results.
 - Always leave a blank line between sections.
 - Use bullets only when it improves readability.
 - Never output long dense paragraphs with inline bullets.
+- When outputting a Markdown table, ALWAYS put each row on its own line.
 
 Facts policy:
 - FACTS_JSON is the only source of factual claims (names, numbers, results).
-- You may use general volleyball knowledge for coaching insights, but label it as inference when needed.
+- You may use general volleyball knowledge for coaching insights, but label it as "coaching inference" when not directly supported by FACTS_JSON.
 
 Behavior:
 - Answer directly.
 - If roster is requested: output a roster table with columns: Player | Position.
-- If asked "best X": show a 1-line answer + a small top-3 table.
-- If asked for changes in losses: provide 5–8 actionable bullets.
-- If asked for lineups: provide BOTH a 5–1 and 6–2 option with a short rationale.
+- If asked "best X": show a 1-line answer + a Top-3 table (Player | Value).
+- If asked for leaders: show top 5 tables for the relevant categories.
+- If asked for "show every game" / "all results": show a match results table.
+- If asked for "record vs opponent": show an opponent table (Opponent | W | L | Set diff | Last played).
+- If asked for changes in losses: provide 6–10 actionable bullets plus 1–2 "quick wins" for the next practice.
+- If asked for lineups: provide BOTH a 5–1 and 6–2 option with short rationale, using:
+  - setter_assists, attack_kills, serve_receive rating/attempts, blocks.
+  - If positions are missing, state assumptions.
+- If user asks "why did we lose to X": use available opponent summary + general volleyball troubleshooting (serve/pass, error control, matchup/rotation).
+
+Never say "Try asking..." unless absolutely necessary.
 `;
 
   const userObj = { question, FACTS_JSON: factsPayload };
@@ -309,7 +375,7 @@ Behavior:
     },
     body: JSON.stringify({
       model,
-      max_output_tokens: 900,
+      max_output_tokens: 1100,
       input: [
         { role: "system", content: [{ type: "input_text", text: system }] },
         { role: "user", content: [{ type: "input_text", text: JSON.stringify(userObj) }] },
@@ -329,7 +395,9 @@ Behavior:
 function fallbackRoster(agg: ReturnType<typeof computeAggregates>) {
   const rec = agg.hasMatches ? `${agg.wins}-${agg.losses}` : "N/A";
   const last = agg.lastMatch
-    ? `${agg.lastMatch.match_date ?? "?"} vs ${agg.lastMatch.opponent ?? "?"} — ${normalizeWinLoss(agg.lastMatch.result) ?? "?"}${agg.lastMatch.score ? ` (${agg.lastMatch.score})` : ""}`
+    ? `${agg.lastMatch.match_date ?? "?"} vs ${agg.lastMatch.opponent ?? "?"} — ${normalizeWinLoss(agg.lastMatch.result) ?? "?"}${
+        agg.lastMatch.score ? ` (${agg.lastMatch.score})` : ""
+      }`
     : "N/A";
 
   const players = Object.keys(agg.positions)
@@ -364,6 +432,43 @@ function fallbackRoster(agg: ReturnType<typeof computeAggregates>) {
   return lines.join("\n");
 }
 
+function fallbackAllMatches(matches: MatchRow[]) {
+  const ms = matches
+    .slice()
+    .sort((a, b) => safeIso(a.match_date).localeCompare(safeIso(b.match_date)));
+
+  const lines: string[] = [];
+  lines.push(`## Match results — MVVC 14 Black`);
+  lines.push("");
+  lines.push(`| Date | Opponent | Result | Score | Tournament | Round |`);
+  lines.push(`|---|---|---|---|---|---|`);
+
+  for (const m of ms) {
+    const date = m.match_date ?? "";
+    const opp = m.opponent ?? "";
+    const res = normalizeWinLoss(m.result) ?? (m.result ?? "");
+    const score = m.score ?? "";
+    const tour = m.tournament ?? "";
+    const round = m.round ?? "";
+    lines.push(`| ${date} | ${opp} | ${res} | ${score} | ${tour} | ${round} |`);
+  }
+
+  return lines.join("\n");
+}
+
+function fallbackVsOpponent(agg: ReturnType<typeof computeAggregates>) {
+  const rows = agg.vsOpponentRows || [];
+  const lines: string[] = [];
+  lines.push(`## Record vs opponents — MVVC 14 Black`);
+  lines.push("");
+  lines.push(`| Opponent | W | L | Set diff | Last played |`);
+  lines.push(`|---|---:|---:|---:|---|`);
+  for (const r of rows) {
+    lines.push(`| ${r.opponent} | ${r.wins} | ${r.losses} | ${r.setDiff} | ${r.lastDate || ""} |`);
+  }
+  return lines.join("\n");
+}
+
 export async function POST(req: Request) {
   try {
     const body = (await req.json()) as { question?: string; thread_id?: string | null };
@@ -385,6 +490,10 @@ export async function POST(req: Request) {
               result: normalizeWinLoss(agg.lastMatch.result),
               score: agg.lastMatch.score,
               tournament: agg.lastMatch.tournament,
+              round: agg.lastMatch.round,
+              sets_won: agg.lastMatch.sets_won,
+              sets_lost: agg.lastMatch.sets_lost,
+              set_diff: agg.lastMatch.set_diff,
             }
           : null,
         teamServeReceive: agg.teamServeReceive,
@@ -400,10 +509,16 @@ export async function POST(req: Request) {
           blocksSoloTop5: topNForKey(agg.byPlayer, "blocks_solo", 5),
           blocksAssistTop5: topNForKey(agg.byPlayer, "blocks_assist", 5),
           passersTop5: topNPassersOverall(agg.byPlayer, 5),
+          serveErrorsTop5: topNForKey(agg.byPlayer, "serve_errors", 5),
+          attackErrorsTop5: topNForKey(agg.byPlayer, "attack_errors", 5),
+          settingErrorsTop5: topNForKey(agg.byPlayer, "setting_errors", 5),
         },
       },
+      opponents: {
+        records: agg.vsOpponentRows,
+        troubleOpponents: agg.troubleOpponents,
+      },
       matches: {
-        // include full list for "show every game" type questions
         all: season.matches.map((m) => ({
           date: m.match_date,
           opponent: m.opponent,
@@ -426,11 +541,20 @@ export async function POST(req: Request) {
       answer = "";
     }
 
-    // If OpenAI fails, still return something readable
     if (!answer) {
       const q = s(question);
+
+      // Strong deterministic fallbacks for the most common asks
       if (q.includes("roster")) answer = fallbackRoster(agg);
-      else answer = "I hit an error generating the response. Try again, or ask for `team roster` or `game results`.";
+      else if (q.includes("every game") || q.includes("all game") || q.includes("game result") || q.includes("show all results") || q.includes("results")) {
+        answer = fallbackAllMatches(season.matches);
+      } else if (q.includes("record vs") || q.includes("vs opponent") || q.includes("against") && q.includes("record")) {
+        answer = fallbackVsOpponent(agg);
+      } else {
+        answer =
+          "I hit an error generating the response.\n\n" +
+          "Try: **team roster**, **show every game result**, **record vs opponent**, or **leaders (top 5)**.";
+      }
     }
 
     return NextResponse.json({ answer, thread_id: body?.thread_id ?? null });
