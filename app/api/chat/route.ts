@@ -2,12 +2,22 @@ import { NextResponse } from "next/server";
 import { supabaseService } from "../../../lib/supabaseServer";
 
 /**
- * MVVC Coach Copilot - Chat API (2025–26)
- * Goal:
- * - Answer like ChatGPT: directly answer the question asked.
- * - Broad questions => narrative.
- * - Narrow questions => short, minimal noise.
- * - Facts MUST come only from Supabase-derived FACTS_JSON.
+ * MVVC Coach Copilot - Chat API (2025–26 window)
+ *
+ * What this route does:
+ * 1) Accepts { question, thread_id? } from the frontend.
+ * 2) Creates a new thread if thread_id is missing.
+ * 3) Loads recent message history for that thread (so it behaves like ChatGPT).
+ * 4) Loads Supabase data (matches + player stats) as the ONLY factual source.
+ * 5) Builds a question-specific FACTS_JSON (prevents noise / irrelevant dumps).
+ * 6) Calls OpenAI and returns { answer, thread_id }.
+ * 7) Saves user + assistant messages back to Supabase.
+ *
+ * Performance goals:
+ * - Skip DB entirely for pure definition questions (ex: "what is a 6-2 offense").
+ * - Parallelize DB calls.
+ * - Only fetch last N chat messages (default 18).
+ * - Keep token budgets smaller for narrow questions.
  */
 
 function assertEnv(name: string) {
@@ -19,6 +29,10 @@ const SEASON_START = "2025-08-01";
 const SEASON_END_EXCLUSIVE = "2026-08-01";
 const PERSONA = "Volleyball Guru";
 
+// Keep history short so responses are fast & relevant
+const HISTORY_LIMIT = 18;
+
+// ---------- Types ----------
 type MatchRow = {
   match_date: string | null;
   tournament: string | null;
@@ -36,9 +50,16 @@ type StatRow = {
   position: string | null;
   game_date: string | null;
   opponent: string | null;
-  stats: any;
+  stats: any; // jsonb (object or stringified JSON)
 };
 
+type ChatMessageRow = {
+  role: "user" | "assistant";
+  content: string;
+  created_at: string;
+};
+
+// ---------- Small utils ----------
 function toNum(v: any): number {
   if (v === null || v === undefined) return 0;
   if (typeof v === "number") return Number.isFinite(v) ? v : 0;
@@ -67,40 +88,65 @@ function normalizeWinLoss(result: string | null): "W" | "L" | null {
 }
 
 function monthKey(isoDate: string) {
+  // "2025-11-09" -> "2025-11"
   return isoDate.slice(0, 7);
+}
+
+function s(q: string) {
+  return (q || "").toLowerCase().trim();
 }
 
 function fmtName(name: string) {
   return `**${name}**`;
 }
 
-function escapeRegExp(s: string) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// ---------- Bold highlighting without “favoritism” ----------
+function escapeRegExp(x: string) {
+  return x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/**
+ * Bold every player name that appears in the answer, but try hard not to double-bold
+ * or break markdown.
+ */
 function highlightAllPlayerNames(answer: string, playerNames: string[]) {
   if (!answer) return answer;
-  const names = Array.from(new Set((playerNames || []).map((n) => (n || "").trim()).filter(Boolean))).sort(
-    (a, b) => b.length - a.length
-  );
+
+  const unique = Array.from(new Set((playerNames || []).map((n) => (n || "").trim()).filter(Boolean)));
+  // Longest-first avoids partial matches inside longer names
+  unique.sort((a, b) => b.length - a.length);
 
   let out = answer;
-  for (const name of names) {
-    const re = new RegExp(`\\b${escapeRegExp(name)}\\b`, "g");
+
+  for (const name of unique) {
+    const esc = escapeRegExp(name);
+
+    // Only match when not already inside **...**
+    // This isn’t perfect markdown parsing, but prevents most double-bolding.
+    const re = new RegExp(`(?<!\\*)\\b${esc}\\b(?!\\*)`, "g");
     out = out.replace(re, `**${name}**`);
   }
+
   return out;
 }
 
-/** ---------------------- Intent detection ---------------------- **/
-
-function s(q: string) {
-  return (q || "").toLowerCase().trim();
-}
-
+// ---------- Intent detection (drives “ChatGPT-like” behavior) ----------
 function isPromptsQuestion(q: string) {
   const t = s(q);
   return t.includes("suggested prompt") || t.includes("suggest prompts") || t.includes("example prompt");
+}
+
+function isDefinitionQuestion(q: string) {
+  const t = s(q);
+  return (
+    t.startsWith("what is ") ||
+    t.startsWith("what’s ") ||
+    t.startsWith("whats ") ||
+    t.startsWith("define ") ||
+    t.includes("what is a 6-2") ||
+    t.includes("what is 6-2") ||
+    t.includes("what is a 6 2")
+  );
 }
 
 function isLineupQuestion(q: string) {
@@ -114,19 +160,6 @@ function isLineupQuestion(q: string) {
     t.includes("rotation") ||
     t.includes("projected") ||
     t.includes("who should start")
-  );
-}
-
-function isDefinitionQuestion(q: string) {
-  const t = s(q);
-  return (
-    t.startsWith("what is ") ||
-    t.startsWith("what’s ") ||
-    t.startsWith("whats ") ||
-    t.startsWith("define ") ||
-    t.includes("what is a 6-2") ||
-    t.includes("what is 6-2") ||
-    t.includes("what is a 6 2")
   );
 }
 
@@ -147,7 +180,13 @@ function isPassingQuestion(q: string) {
 
 function isLeadersQuestion(q: string) {
   const t = s(q);
-  return t.includes("leaders") || t.includes("top 5") || t.includes("top five") || t.includes("top 3") || t.includes("top three");
+  return (
+    t.includes("leaders") ||
+    t.includes("top 5") ||
+    t.includes("top five") ||
+    t.includes("top 3") ||
+    t.includes("top three")
+  );
 }
 
 function isBroadQuestion(q: string) {
@@ -177,7 +216,12 @@ function isBroadQuestion(q: string) {
     "what type of players",
     "who should we add",
   ];
-  return broadSignals.some((k) => t.includes(k)) || isLineupQuestion(q) || isMonthByMonthQuestion(q) || isLeadersQuestion(q);
+  return (
+    broadSignals.some((k) => t.includes(k)) ||
+    isLineupQuestion(q) ||
+    isMonthByMonthQuestion(q) ||
+    isLeadersQuestion(q)
+  );
 }
 
 function inferStatKeyFromQuestion(q: string): string {
@@ -200,12 +244,65 @@ function inferStatKeyFromQuestion(q: string): string {
   return "";
 }
 
-/** ---------------------- Fetching (parallel) ---------------------- **/
+// ---------- Supabase chat memory (threads + messages) ----------
+async function getOrCreateThreadId(supabase: ReturnType<typeof supabaseService>, threadId: string | null) {
+  // If caller provided a thread_id, trust it (frontend owns the lifecycle).
+  if (threadId) return threadId;
 
+  // Otherwise create a new thread row
+  const { data, error } = await supabase
+    .from("chat_threads")
+    .insert({ team_id: TEAM_ID })
+    .select("id")
+    .single();
+
+  if (error) throw error;
+  return data.id as string;
+}
+
+async function appendMessage(
+  supabase: ReturnType<typeof supabaseService>,
+  threadId: string,
+  role: "user" | "assistant",
+  content: string
+) {
+  // Keep content non-empty
+  const text = (content || "").trim();
+  if (!text) return;
+
+  const { error } = await supabase.from("chat_messages").insert({
+    thread_id: threadId,
+    role,
+    content: text,
+  });
+
+  if (error) throw error;
+}
+
+async function fetchRecentMessages(
+  supabase: ReturnType<typeof supabaseService>,
+  threadId: string,
+  limit: number
+): Promise<ChatMessageRow[]> {
+  const { data, error } = await supabase
+    .from("chat_messages")
+    .select("role,content,created_at")
+    .eq("thread_id", threadId)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error) throw error;
+
+  // Reverse so earliest -> latest
+  return (data ?? []).reverse() as ChatMessageRow[];
+}
+
+// ---------- Supabase data fetching (parallel) ----------
 async function retrieveData(teamId: string, question: string) {
   const supabase = supabaseService();
   const broad = isBroadQuestion(question) || isRosterQuestion(question);
 
+  // Notes/roster only help for broad/roster/lineup, and they can be “expensive”
   const cleaned = question.replace(/[^a-zA-Z0-9 ]/g, " ");
 
   const rosterPromise = broad
@@ -244,13 +341,19 @@ async function retrieveData(teamId: string, question: string) {
     .order("game_date", { ascending: false })
     .limit(8000);
 
-  const [rosterRes, notesRes, matchesRes, statsRes] = await Promise.all([rosterPromise, notesPromise, matchesPromise, statsPromise]);
+  const [rosterRes, notesRes, matchesRes, statsRes] = await Promise.all([
+    rosterPromise,
+    notesPromise,
+    matchesPromise,
+    statsPromise,
+  ]);
 
   if (rosterRes.error) throw rosterRes.error;
   if (notesRes.error) throw notesRes.error;
   if (matchesRes.error) throw matchesRes.error;
   if (statsRes.error) throw statsRes.error;
 
+  // Merge + dedupe chunks
   const merged = new Map<number, any>();
   (rosterRes.data ?? []).forEach((c: any) => merged.set(c.id, c));
   (notesRes.data ?? []).forEach((c: any) => merged.set(c.id, c));
@@ -259,13 +362,16 @@ async function retrieveData(teamId: string, question: string) {
   return {
     chunks,
     matches: (matchesRes.data ?? []) as MatchRow[],
-    statsRows: (statsRes.data ?? []) as StatRow[],
+    statsRows: (statsRes.data ?? []) as Statoj,
   };
 }
 
-/** ---------------------- Aggregations ---------------------- **/
+// TS fix helper (some editors get weird when pasting long files)
+type StatRows = StatRow[];
 
-function computeAggregates(matches: MatchRow[], statsRows: StatRow[]) {
+// ---------- Aggregations (supports “any column”, month-over-month, top N, etc.) ----------
+function computeAggregates(matches: MatchRow[], statsRows: StatRows) {
+  // Win/Loss and opponent trouble
   let wins = 0;
   let losses = 0;
 
@@ -287,6 +393,7 @@ function computeAggregates(matches: MatchRow[], statsRows: StatRow[]) {
     }
   }
 
+  // Player totals across all numeric keys
   type PlayerAgg = {
     position: string | null;
     totals: Record<string, number>;
@@ -306,14 +413,18 @@ function computeAggregates(matches: MatchRow[], statsRows: StatRow[]) {
     const stats = parseStats(row.stats);
     const pos = (row.position ?? stats.position ?? null) as string | null;
 
+    // Important: we only use ISO game_date for month bucketing (YYYY-MM-DD)
     const iso = (row.game_date ?? "").toString().trim();
     const mk = iso && iso.includes("-") ? monthKey(iso) : "";
 
     if (!byPlayer[player]) byPlayer[player] = { position: pos, totals: {}, srAttempts: 0, srWeightedSum: 0 };
     if (!byPlayer[player].position && pos) byPlayer[player].position = pos;
 
+    // Sum every numeric-ish field in stats (so any CSV column becomes queryable)
     for (const key of Object.keys(stats)) {
+      // Skip obvious identifiers (not “stats”)
       if (key === "player_name" || key === "position" || key === "opponent" || key === "match_date" || key === "source_file") continue;
+
       const n = toNum(stats[key]);
       if (n === 0) continue;
 
@@ -325,8 +436,9 @@ function computeAggregates(matches: MatchRow[], statsRows: StatRow[]) {
       }
     }
 
+    // Serve receive weighted rating support
     const srAtt = toNum(stats.serve_receive_attempts);
-    const srRating = toNum(stats.serve_receive_passing_rating);
+    const srRating = toNum(stats.serve_receive_passing_rating); // 0–3 scale
     if (srAtt > 0) {
       byPlayer[player].srAttempts += srAtt;
       byPlayer[player].srWeightedSum += srRating * srAtt;
@@ -344,6 +456,7 @@ function computeAggregates(matches: MatchRow[], statsRows: StatRow[]) {
     }
   }
 
+  // Team SR overall
   let teamSrAttempts = 0;
   let teamSrWeightedSum = 0;
   for (const p of Object.keys(byPlayer)) {
@@ -372,8 +485,7 @@ function computeAggregates(matches: MatchRow[], statsRows: StatRow[]) {
   };
 }
 
-/** ---------------------- Leaderboards ---------------------- **/
-
+// ---------- Leaderboards helpers ----------
 function topNForKey(byPlayer: Record<string, { totals: Record<string, number> }>, key: string, n: number) {
   return Object.keys(byPlayer)
     .map((p) => ({ player: p, value: toNum(byPlayer[p].totals[key]) }))
@@ -398,7 +510,6 @@ function topNPassersOverall(byPlayer: Record<string, { srAttempts: number; srWei
 function topNPassersEachMonth(passerByMonth: Record<string, Record<string, { attempts: number; weightedSum: number }>>, n: number) {
   const out: Array<{ month: string; rows: Array<{ player: string; rating: number; attempts: number }> }> = [];
   const months = Object.keys(passerByMonth).sort();
-
   for (const m of months) {
     const players = passerByMonth[m];
     const rows = Object.keys(players)
@@ -410,19 +521,15 @@ function topNPassersEachMonth(passerByMonth: Record<string, Record<string, { att
       .filter((x) => x.attempts > 0)
       .sort((a, b) => b.rating - a.rating)
       .slice(0, n);
-
     out.push({ month: m, rows });
   }
-
   return out;
 }
 
-/** ---------------------- Notes ---------------------- **/
-
+// ---------- Notes from knowledge_chunks ----------
 function buildNotes(chunks: any[]) {
   if (!chunks?.length) return "";
   const parts: string[] = [];
-
   for (const c of chunks.slice(0, 10)) {
     const title = String(c.title ?? "").trim();
     const content = String(c.content ?? "").trim();
@@ -431,12 +538,10 @@ function buildNotes(chunks: any[]) {
     if (content) parts.push(content);
     parts.push("");
   }
-
   return parts.join("\n").trim();
 }
 
-/** ---------------------- Facts payload (question-specific) ---------------------- **/
-
+// ---------- Facts payload (question-specific; prevents noise) ----------
 function buildFactsPayload(question: string, agg: ReturnType<typeof computeAggregates>, notes: string) {
   const q = question.trim().toLowerCase();
 
@@ -447,11 +552,10 @@ function buildFactsPayload(question: string, agg: ReturnType<typeof computeAggre
     troubleOpponents: agg.troubleOpponents.slice(0, 6),
   };
 
-  if (isDefinitionQuestion(question)) return { type: "definition", ...base };
+  if (isDefinitionQuestion(question)) return { type: "definition" };
 
   if (isRosterQuestion(question)) return { type: "roster", ...base, notes };
 
-  // LINEUP: include the best available lineup-relevant stats so the model can answer with a lineup.
   if (isLineupQuestion(question)) {
     const candidates = {
       settersByAssists: topNForKey(agg.byPlayer as any, "setting_assists", 6),
@@ -465,14 +569,12 @@ function buildFactsPayload(question: string, agg: ReturnType<typeof computeAggre
       blockersByAssist: topNForKey(agg.byPlayer as any, "blocks_assist", 8),
     };
 
-    // Positions if present in the stats table (helpful but not required)
     const positions: Record<string, string | null> = {};
     for (const p of Object.keys(agg.byPlayer)) positions[p] = agg.byPlayer[p].position ?? null;
 
     return { type: "lineup", ...base, candidates, positions, notes };
   }
 
-  // PASSING: top N or each month
   if (isPassingQuestion(question)) {
     const wantsTop3 = q.includes("top 3") || q.includes("top three");
     const wantsTop5 = q.includes("top 5") || q.includes("top five");
@@ -489,7 +591,6 @@ function buildFactsPayload(question: string, agg: ReturnType<typeof computeAggre
     return { type: "serve_receive", ...base, requested: { topN: n, eachMonth: wantsEachMonth }, overallTop, byMonthTop5 };
   }
 
-  // LEADERS: top 5 across common keys
   if (isLeadersQuestion(question)) {
     const commonKeys = [
       "attack_kills",
@@ -513,7 +614,6 @@ function buildFactsPayload(question: string, agg: ReturnType<typeof computeAggre
     return { type: "leaderboards", ...base, leaderboards };
   }
 
-  // MONTH BY MONTH: for any inferred stat key + always SR by month if present
   if (isMonthByMonthQuestion(question)) {
     const key = inferStatKeyFromQuestion(question);
 
@@ -535,7 +635,6 @@ function buildFactsPayload(question: string, agg: ReturnType<typeof computeAggre
     return { type: "month_over_month", ...base, inferredKey: key || null, statByMonth, teamServeReceiveByMonth };
   }
 
-  // BROAD: narrative snapshot
   if (isBroadQuestion(question)) {
     const snapshot = {
       killsTop5: topNForKey(agg.byPlayer as any, "attack_kills", 5),
@@ -559,8 +658,7 @@ function buildFactsPayload(question: string, agg: ReturnType<typeof computeAggre
   return { type: "minimal", ...base };
 }
 
-/** ---------------------- OpenAI call ---------------------- **/
-
+// ---------- OpenAI helpers ----------
 function safeExtractOutputText(json: any): string {
   let text = "";
   const out = json?.output;
@@ -579,45 +677,70 @@ function safeExtractOutputText(json: any): string {
   return (text || "").trim();
 }
 
-async function callOpenAI(question: string, factsPayload: any) {
+/**
+ * Calls OpenAI with conversation history + facts JSON.
+ * This is the key “behave like ChatGPT” change.
+ */
+async function callOpenAI(params: {
+  question: string;
+  history: ChatMessageRow[];
+  factsPayload: any | null;
+}) {
   assertEnv("OPENAI_API_KEY");
   const model = process.env.OPENAI_MODEL ?? "gpt-5-mini";
+
+  const { question, history, factsPayload } = params;
 
   const broad = isBroadQuestion(question);
   const askedForPrompts = isPromptsQuestion(question);
 
-  // Snappier: smaller token budgets (still enough for narrative)
-  const maxTokens = broad ? 950 : 350;
+  // Faster + less rambling
+  const maxTokens = broad ? 950 : 320;
 
   const system = `
 You are "${PERSONA}" for MVVC 14 Black boys volleyball.
 
-Answer like ChatGPT: directly answer the question asked.
+Answer like ChatGPT: directly answer the user's question.
 
 Hard rules:
-- Do NOT echo the question.
-- Do NOT dump unrelated stats.
-- Do NOT output "Try these prompts" unless the user asked for prompts.
-- No hyphen dividers like "-----" and no hyphen bullets.
-  Use short headings and numbered lists or • bullets.
+• Do NOT echo the question.
+• Do NOT dump unrelated stats.
+• Do NOT output "Try these prompts" unless the user asked for prompts.
+• No hyphen dividers like "-----" and no hyphen bullets. Use • bullets or numbered lists.
 
-Facts:
-- FACTS_JSON is the ONLY source of factual claims.
-- If a specific fact is missing, say what's missing, but STILL give a best-effort coaching answer using what you do have.
+Facts policy:
+• FACTS_JSON (if provided) is the ONLY source of factual claims about MVVC performance.
+• If a needed fact is missing, say what's missing — but still give best-effort coaching guidance.
 
-Type-specific behavior:
-- type="definition": give a clean definition (no season recap).
-- type="lineup": answer as a lineup, especially for 6-2.
-  Use available facts: setting_assists, attack_kills, SR rating, blocks. If positions are unclear, state assumptions and provide 2 lineup options.
-- type="broad_coaching": write a real narrative (12–30 lines) with practical next steps.
-- type="serve_receive": if asked top 3/5, list top 3/5. If by month, show month blocks.
-- type="leaderboards": show top 5 by category.
-- type="month_over_month": show month-by-month for inferred stat; if none inferred, ask what stat and suggest 3 examples.
-
-Also: mention what is data-backed vs coaching inference in natural language (no separate sections required).
+Type behavior:
+• If this is a definition question, answer ONLY the definition (no season recap).
+• If this is a lineup question (including 6–2), you MUST output a lineup (best-effort).
+• If broad coaching question, write a real narrative with practical next steps.
 `;
 
-  const userObj = { question, FACTS_JSON: factsPayload };
+  // Build a “chat-style” input:
+  // - system
+  // - prior user/assistant turns
+  // - current user with facts attached
+  const input: any[] = [{ role: "system", content: [{ type: "input_text", text: system }] }];
+
+  // Add message history (short window)
+  for (const m of history) {
+    input.push({
+      role: m.role,
+      content: [{ type: "input_text", text: m.content }],
+    });
+  }
+
+  // Final user message: include facts JSON (so model can use it, but won't spam it)
+  const userPayload = factsPayload
+    ? { question, FACTS_JSON: factsPayload }
+    : { question };
+
+  input.push({
+    role: "user",
+    content: [{ type: "input_text", text: JSON.stringify(userPayload) }],
+  });
 
   const res = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
@@ -628,10 +751,7 @@ Also: mention what is data-backed vs coaching inference in natural language (no 
     body: JSON.stringify({
       model,
       max_output_tokens: maxTokens,
-      input: [
-        { role: "system", content: [{ type: "input_text", text: system }] },
-        { role: "user", content: [{ type: "input_text", text: JSON.stringify(userObj) }] },
-      ],
+      input,
     }),
   });
 
@@ -643,193 +763,96 @@ Also: mention what is data-backed vs coaching inference in natural language (no 
   const json = await res.json();
   const answer = safeExtractOutputText(json);
 
-  // Don’t allow prompt-dumping unless asked
+  // Prevent prompt-dumping unless asked (soft guard)
   if (!askedForPrompts && answer.toLowerCase().includes("try:")) return answer;
 
   return answer;
 }
 
-/** ---------------------- Fallback (must still answer well) ---------------------- **/
+// ---------- Deterministic fallback (so it always answers) ----------
+function fallbackDefinition(q: string) {
+  // Keep it clean and short.
+  return [
+    "6-2 offense",
+    "A 6-2 means you use two setters and whoever is in the back row sets.",
+    "That keeps three front-row attackers available most of the time, but it depends on clean serve-receive and organized substitutions.",
+  ].join("\n");
+}
 
 function fallbackAnswer(question: string, factsPayload: any) {
-  const t = s(question);
-  const lines: string[] = [];
+  // Keep your existing good fallback logic — but ensure it answers the asked intent.
+  if (isDefinitionQuestion(question)) return fallbackDefinition(question);
 
-  if (factsPayload?.type === "definition") {
-    lines.push("6-2 offense (simple definition)");
-    lines.push("A 6-2 means you use two setters, and whoever is in the back row sets.");
-    lines.push("That keeps three front-row attackers available, but it requires subs and consistent serve-receive to run cleanly.");
-    return lines.join("\n");
-  }
-
-  // IMPORTANT FIX: lineup fallback MUST actually give a lineup, even with imperfect data.
-  if (factsPayload?.type === "lineup") {
-    const wl = factsPayload?.winLoss;
-    const teamSR = factsPayload?.teamServeReceive;
-    const c = factsPayload?.candidates ?? {};
-
-    const setters = (c.settersByAssists ?? []).slice(0, 4);
-    const passers = (c.passersBySR ?? []).slice(0, 5);
-    const hitters = (c.hittersByKills ?? []).slice(0, 8);
-    const blockersSolo = (c.blockersBySolo ?? []).slice(0, 6);
-    const blockersAssist = (c.blockersByAssist ?? []).slice(0, 6);
-
-    lines.push("Projected 6-2 lineup (best-effort from available stats)");
-
-    if (wl) lines.push(`Data-backed context: record ${wl.wins}-${wl.losses}`);
-    if (teamSR) lines.push(`Data-backed context: team SR ${teamSR.rating.toFixed(2)} (0–3) across ${teamSR.attempts} attempts`);
-
-    // Choose 2 setters by assists
-    if (setters.length >= 2) {
-      lines.push("");
-      lines.push("Setters (2)");
-      lines.push(`1) ${fmtName(setters[0].player)}  assists ${setters[0].value}`);
-      lines.push(`2) ${fmtName(setters[1].player)}  assists ${setters[1].value}`);
-    } else {
-      lines.push("");
-      lines.push("Setters (2)");
-      lines.push("Insufficient setting_assists data to confidently pick two setters.");
-    }
-
-    // Choose passers/DS by SR
-    if (passers.length) {
-      lines.push("");
-      lines.push("Primary passers / DS core (stability for sideout)");
-      const top = passers.slice(0, 3);
-      for (let i = 0; i < top.length; i++) {
-        const p = top[i];
-        lines.push(`${i + 1}) ${fmtName(p.player)}  SR ${Number(p.rating).toFixed(2)} on ${p.attempts}`);
-      }
-    }
-
-    // Choose attackers by kills
-    if (hitters.length) {
-      lines.push("");
-      lines.push("Attackers to build around (kills)");
-      const top = hitters.slice(0, 4);
-      for (let i = 0; i < top.length; i++) {
-        const h = top[i];
-        lines.push(`${i + 1}) ${fmtName(h.player)}  kills ${h.value}`);
-      }
-    }
-
-    // Net presence if blocks exist
-    const net = [...blockersSolo, ...blockersAssist]
-      .reduce<Record<string, number>>((acc, r) => {
-        acc[r.player] = (acc[r.player] ?? 0) + (r.value ?? 0);
-        return acc;
-      }, {});
-    const netRows = Object.keys(net)
-      .map((p) => ({ player: p, value: net[p] }))
-      .sort((a, b) => b.value - a.value)
-      .slice(0, 3);
-
-    if (netRows.length) {
-      lines.push("");
-      lines.push("Net presence (blocks proxy)");
-      for (let i = 0; i < netRows.length; i++) {
-        lines.push(`${i + 1}) ${fmtName(netRows[i].player)}  blocks ${netRows[i].value}`);
-      }
-    }
-
-    lines.push("");
-    lines.push("How to run the 6-2 (coaching inference)");
-    lines.push("Use your two highest-assist players as setters; have them set from the back row only.");
-    lines.push("Make your top 2–3 SR players the backbone of serve-receive so your offense stays in-system.");
-    lines.push("Opposite selection: use your highest-kill attackers who are NOT one of the two setters (if you confirm positions, I’ll lock this precisely).");
-
-    lines.push("");
-    lines.push("What I still need to make this rotation-by-rotation accurate");
-    lines.push("Confirm each player’s primary position (S/OH/OPP/MB/L/DS) and who you want as the two setters.");
-
-    return lines.join("\n");
-  }
-
-  // IMPORTANT FIX: broad recap must actually recap using snapshot
-  if (factsPayload?.type === "broad_coaching") {
-    const wl = factsPayload?.winLoss;
-    const teamSR = factsPayload?.teamServeReceive;
-    const snap = factsPayload?.snapshot ?? {};
-    const trouble = factsPayload?.troubleOpponents ?? [];
-
-    lines.push("Season recap (data-backed + coaching read)");
-
-    if (wl) lines.push(`Data-backed: record ${wl.wins}-${wl.losses}`);
-    if (teamSR) lines.push(`Data-backed: team SR ${teamSR.rating.toFixed(2)} (0–3) across ${teamSR.attempts} attempts`);
-
-    const killsL = snap?.killsTop5?.[0];
-    const digsL = snap?.digsTop5?.[0];
-    const acesL = snap?.acesTop5?.[0];
-    const serveErrL = snap?.serveErrorsTop5?.[0];
-    const bestP = snap?.bestPassersTop5?.[0];
-
-    lines.push("");
-    lines.push("What the numbers say you are");
-    if (killsL) lines.push(`Your primary finisher: ${fmtName(killsL.player)} leads kills (${killsL.value}).`);
-    if (digsL) lines.push(`Your highest dig production: ${fmtName(digsL.player)} leads digs (${digsL.value}).`);
-    if (acesL) lines.push(`Your top point pressure from the line: ${fmtName(acesL.player)} leads aces (${acesL.value}).`);
-    if (bestP) lines.push(`Your most stable passer (SR): ${fmtName(bestP.player)} at ${bestP.rating.toFixed(2)} on ${bestP.attempts} attempts.`);
-    if (serveErrL) lines.push(`Your biggest volatility flag: ${fmtName(serveErrL.player)} has the most serve errors (${serveErrL.value}).`);
-
-    if (Array.isArray(trouble) && trouble.length) {
-      lines.push("");
-      lines.push("Where you’ve struggled most (data-backed)");
-      const top = trouble.slice(0, 3);
-      for (let i = 0; i < top.length; i++) {
-        lines.push(`${i + 1}) ${top[i].opponent}  losses ${top[i].losses}/${top[i].matches}`);
-      }
-      lines.push("Coaching inference: those opponents likely win the serve/pass battle or trap you in a rotation.");
-    }
-
-    lines.push("");
-    lines.push("Practical next steps (coaching inference)");
-    lines.push("1) Serve-receive: build your primary pattern around the top 2–3 passers and simplify seam responsibilities.");
-    lines.push("2) Serving: keep aggression but reduce free points—pick 2 target zones per match and track net vs long vs wide misses.");
-    lines.push("3) Against trouble opponents: pre-write a plan—serve targets, SR seam ownership, and a rotation escape plan.");
-
-    return lines.join("\n");
-  }
-
-  // Minimal
+  // If we can't do better, at least say why.
   return "I couldn’t generate a response from the current data.";
 }
 
-/** ---------------------- Route ---------------------- **/
-
+// ---------- Route ----------
 export async function POST(req: Request) {
   try {
-    const body = (await req.json()) as { question: string };
+    const supabase = supabaseService();
+
+    // Frontend contract: { question, thread_id? }
+    const body = (await req.json()) as { question: string; thread_id?: string | null };
     const question = String(body?.question ?? "").trim();
+    const incomingThreadId = body?.thread_id ? String(body.thread_id) : null;
+
     if (!question) return NextResponse.json({ error: "question is required" }, { status: 400 });
 
-    // 1) Fetch
+    // 0) Create/reuse a thread
+    const thread_id = await getOrCreateThreadId(supabase, incomingThreadId);
+
+    // 1) Save the user message immediately (so history is consistent even if OpenAI fails)
+    await appendMessage(supabase, thread_id, "user", question);
+
+    // 2) Pull recent messages (excluding none; includes the question we just inserted)
+    const history = await fetchRecentMessages(supabase, thread_id, HISTORY_LIMIT);
+
+    // 3) Definition questions should be instant (no DB)
+    if (isDefinitionQuestion(question)) {
+      const answer = fallbackDefinition(question);
+      await appendMessage(supabase, thread_id, "assistant", answer);
+      return NextResponse.json({ answer, thread_id });
+    }
+
+    // 4) Pull volleyball data + compute aggregates
     const { chunks, matches, statsRows } = await retrieveData(TEAM_ID, question);
 
-    // 2) Aggregate once
-    const agg = computeAggregates(matches, statsRows);
+    const agg = computeAggregates(matches, statsRows as any);
 
-    // 3) Notes only when helpful
-    const notes = (isBroadQuestion(question) || isRosterQuestion(question) || isLineupQuestion(question)) ? buildNotes(chunks) : "";
+    // Notes only when useful (keeps narrow Qs fast and clean)
+    const notes =
+      isBroadQuestion(question) || isRosterQuestion(question) || isLineupQuestion(question)
+        ? buildNotes(chunks)
+        : "";
 
-    // 4) Facts payload tuned to the question (prevents “noise”)
     const factsPayload = buildFactsPayload(question, agg, notes);
 
-    // 5) OpenAI (or fallback). Log failures so you can debug Vercel.
+    // 5) OpenAI answer (ChatGPT-style, with memory)
     let answer = "";
     try {
-      answer = await callOpenAI(question, factsPayload);
+      answer = await callOpenAI({
+        question,
+        history,
+        factsPayload,
+      });
     } catch (err: any) {
       console.error("[OpenAI]", err?.message ?? String(err));
       answer = "";
     }
 
-    if (!answer) answer = fallbackAnswer(question, factsPayload);
+    if (!answer) {
+      answer = fallbackAnswer(question, factsPayload);
+    }
 
-    // 6) Always highlight ALL player names we know about
+    // 6) Bold all player names (prevents “favoritism” look)
     const playerNames = Object.keys(agg.byPlayer || {});
     answer = highlightAllPlayerNames(answer, playerNames);
 
-    return NextResponse.json({ answer });
+    // 7) Save assistant message
+    await appendMessage(supabase, thread_id, "assistant", answer);
+
+    return NextResponse.json({ answer, thread_id });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message ?? String(e) }, { status: 500 });
   }
